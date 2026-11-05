@@ -409,6 +409,9 @@ template getMask*(size: static int, T: untyped): Mask =
 func none(): void =
   discard
 
+func error(): void =
+  discard
+
 import tables
 
 template maskType*(T: typedesc): typedesc =
@@ -606,6 +609,14 @@ proc opTwoDiffGenImpl(name, T1, T2, T3, code: NimNode): NimNode =
     newStmtList(code)
   )
 
+proc opLoadGenImpl(name, S, T, code: NimNode): NimNode =
+  let a = ident("a")
+  result = newProc(
+    name,
+    [T, newIdentDefs(a, S)],
+    newStmtList(code)
+  )
+
 # =============================================================================
 # Input macro
 # =============================================================================
@@ -625,6 +636,10 @@ macro simdInput*(arch: static string, body: untyped): untyped =
       for typeNode, exprNode in pairsInBlock(opValue):
         let dtype = keyStr(typeNode)
         var expr = unwrapOne(exprNode)
+
+        if expr.kind == nnkIdent and $expr == "error":
+          storeExpr(arch, op, dtype, typeNode, ident("error"))
+          continue
 
         if expr.kind == nnkCall:
           let callee = expr[0]
@@ -667,6 +682,10 @@ macro simdUnaryInput*(arch: static string, body: untyped): untyped =
       for typeNode, exprNode in pairsInBlock(opValue):
         let dtype = keyStr(typeNode)
         var expr = unwrapOne(exprNode)
+
+        if expr.kind == nnkIdent and $expr == "error":
+          storeExpr(arch, op, dtype, typeNode, ident("error"))
+          continue
 
         if expr.kind == nnkCall:
           let callee = expr[0]
@@ -711,6 +730,10 @@ macro simdMaskInput*(arch: static string, body: untyped): untyped =
         let dtype = keyStr(typeNode)
         var expr = unwrapOne(exprNode)
 
+        if expr.kind == nnkIdent and $expr == "error":
+          storeExpr(arch, op, dtype, typeNode, ident("error"))
+          continue
+
         if expr.kind == nnkCall:
           let callee = expr[0]
           if callee.kind == nnkIdent:
@@ -742,7 +765,6 @@ macro simdLoadInput*(arch: static string, body: untyped): untyped =
   result = newStmtList()
   for opNode, opValueRaw in pairsInBlock(body):
     let op = keyStr(opNode)
-
     if not simdArity.hasKey(op):
       simdArity[op] = 0
 
@@ -752,6 +774,22 @@ macro simdLoadInput*(arch: static string, body: untyped): untyped =
       for typeNode, exprNode in pairsInBlock(opValue):
         let dtype = keyStr(typeNode)
         var expr = unwrapOne(exprNode)
+
+        if expr.kind == nnkIdent and $expr == "error":
+          storeExpr(arch, op, dtype, typeNode, ident("error"))
+          continue
+
+        if expr.kind == nnkCall:
+          let callee = expr[0]
+          if callee.kind == nnkIdent:
+            let calleeName = $callee
+            if calleeName == "opLoadGen":
+              let expanded = opLoadGenImpl(expr[1], expr[2], expr[3], expr[4])
+              result.add(expanded)
+              expr = expr[1]
+            elif calleeName in ["typeGen", "maskGen", "opTwoGen", "opTwoDiffGen",
+                                "typeOneGen", "maskOneGen", "opOneGen"]:
+              error(calleeName & " is not allowed in simdLoadInput. Use opLoadGen instead.", expr)
 
         storeExpr(arch, op, dtype, typeNode, expr)
     else:
@@ -3207,6 +3245,190 @@ proc emitLoadPPC(op, dtype, altivec, fb: NimNode): NimNode =
       else:
         cast[`r512`](`op_ppc_512`(a))
 
+proc emitDiffX86(op, T1, T2, T3, sse, avx, avx512, fb: NimNode): NimNode =
+  let opName = repr(op)
+  let typeName1 = repr(T1)
+  let typeName2 = repr(T2)
+  let typeName3 = repr(T3)
+
+  template shortTypeMap(typeName: string): string =
+    let short = case typeName
+    of "float32": "f32"
+    of "float64": "f64"
+    of "int8": "i8"
+    of "int16": "i16"
+    of "int32": "i32"
+    of "int64": "i64"
+    of "uint8": "u8"
+    of "uint16": "u16"
+    of "uint32": "u32"
+    of "uint64": "u64"
+    else: typeName
+    short
+
+  let short1 = shortTypeMap(typeName1)
+  let short2 = shortTypeMap(typeName2)
+  let short3 = shortTypeMap(typeName3)
+
+  let r128_1 = ident(short1 & "r128")
+  let r256_1 = ident(short1 & "r256")
+  let r512_1 = ident(short1 & "r512")
+
+  let r128_2 = ident(short2 & "r128")
+  let r256_2 = ident(short2 & "r256")
+  let r512_2 = ident(short2 & "r512")
+
+  let r128_3 = ident(short3 & "r128")
+  let r256_3 = ident(short3 & "r256")
+  let r512_3 = ident(short3 & "r512")
+
+  let op_r128_sse = ident(opName & "_r128_sse")
+  let op_r256_sse = ident(opName & "_r256_sse")
+  let op_r256_avx = ident(opName & "_r256_avx")
+  let op_r512_sse = ident(opName & "_r512_sse")
+  let op_r512_avx = ident(opName & "_r512_avx")
+  let op_r512_avx512 = ident(opName & "_r512_avx512")
+
+  let op_x86_128 = ident(opName & short & "_x86_128")
+  let op_x86_256 = ident(opName & short & "_x86_256")
+  let op_x86_512 = ident(opName & short & "_x86_512")
+
+  let hasSSE = not (sse.kind == nnkIdent and $sse == "none")
+  let hasAVX = not (avx.kind == nnkIdent and $avx == "none")
+  let hasAVX512 = not (avx512.kind == nnkIdent and $avx512 == "none")
+
+  result = quote do:
+    type
+      Raw128_1 = getRawRegister(`r128_1`)
+      Raw256_1 = getRawRegister(`r256_1`)
+      Raw512_1 = getRawRegister(`r512_1`)
+
+      Raw128_2 = getRawRegister(`r128_2`)
+      Raw256_2 = getRawRegister(`r256_2`)
+      Raw512_2 = getRawRegister(`r512_2`)
+
+      Raw128_3 = getRawRegister(`r128_3`)
+      Raw256_3 = getRawRegister(`r256_3`)
+      Raw512_3 = getRawRegister(`r512_3`)
+
+    when `hasSSE`:
+      func `op_r128_sse`(a: register[16, `T1`, Raw128_1], b: register[16, `T2`, Raw128_2]): register[16, `T3`, Raw128_3] =
+        return cast[register[16, `T3`, Raw128_3]](
+          `sse`(cast[Raw128_1](a), cast[Raw128_2](b))
+        )
+
+    when `hasSSE`:
+      func `op_r256_sse`(a: ptr `T`): register[32, `T`, Raw256] =
+        var outVal: register[32, `T`, Raw256]
+        let pOut = cast[ptr array[2, Raw128]](addr outVal)
+        let pIn = cast[ptr array[2, Raw128]](a)
+        pOut[0] = `sse`(pIn[0])
+        pOut[1] = `sse`(pIn[1])
+        return outVal
+
+    when `hasAVX`:
+      func `op_r256_avx`(a: ptr `T`): register[32, `T`, Raw256] =
+        return cast[register[32, `T`, Raw256]](
+          `avx`(cast[ptr Raw256](a))
+        )
+
+    when `hasSSE`:
+      func `op_r512_sse`(a: ptr `T`): register[64, `T`, Raw512] =
+        var outVal: register[64, `T`, Raw512]
+        let pOut = cast[ptr array[4, Raw128]](addr outVal)
+        let pIn = cast[ptr array[4, Raw128]](a)
+        pOut[0] = `sse`(pIn[0])
+        pOut[1] = `sse`(pIn[1])
+        pOut[2] = `sse`(pIn[2])
+        pOut[3] = `sse`(pIn[3])
+        return outVal
+
+    when `hasAVX`:
+      func `op_r512_avx`(a: ptr `T`): register[64, `T`, Raw512] =
+        var outVal: register[64, `T`, Raw512]
+        let pOut = cast[ptr array[2, Raw256]](addr outVal)
+        let pIn = cast[ptr array[2, Raw256]](a)
+        pOut[0] = `avx`(pIn[0])
+        pOut[1] = `avx`(pIn[1])
+        return outVal
+
+    when `hasAVX512`:
+      func `op_r512_avx512`(a: ptr `T`): register[64, `T`, Raw512] =
+        return cast[register[64, `T`, Raw512]](
+          `avx512`(cast[ptr Raw512](a))
+        )
+
+    let `op_x86_128`: proc (a: ptr `T`): register[16, `T`, Raw128] =
+      when `hasSSE`:
+        if SSE: `op_r128_sse`
+        else: `fb`[16, `T`, Raw128]
+      else:
+        `fb`[16, `T`, Raw128]
+
+    let `op_x86_256`: proc (a: ptr `T`): register[32, `T`, Raw256] =
+      when `hasAVX` and `hasSSE`:
+        if AVX: `op_r256_avx`
+        elif `hasSSE` and SSE: `op_r256_sse`
+        else: `fb`[32, `T`, Raw256]
+      elif `hasAVX`:
+        if AVX: `op_r256_avx`
+        else: `fb`[32, `T`, Raw256]
+      elif `hasSSE`:
+        if SSE: `op_r256_sse`
+        else: `fb`[32, `T`, Raw256]
+      else:
+        `fb`[32, `T`, Raw256]
+
+    let `op_x86_512`: proc (a: ptr `T`): register[64, `T`, Raw512] =
+      when `hasAVX512` and `hasAVX` and `hasSSE`:
+        if AVX512: `op_r512_avx512`
+        elif `hasAVX` and AVX: `op_r512_avx`
+        elif `hasSSE` and SSE: `op_r512_sse`
+        else: `fb`[64, `T`, Raw512]
+      elif `hasAVX512` and `hasAVX`:
+        if AVX512: `op_r512_avx512`
+        elif `hasAVX` and AVX: `op_r512_avx`
+        else: `fb`[64, `T`, Raw512]
+      elif `hasAVX512`:
+        if AVX512: `op_r512_avx512`
+        else: `fb`[64, `T`, Raw512]
+      elif `hasAVX` and `hasSSE`:
+        if AVX: `op_r512_avx`
+        elif SSE: `op_r512_sse`
+        else: `fb`[64, `T`, Raw512]
+      elif `hasAVX`:
+        if AVX: `op_r512_avx`
+        else: `fb`[64, `T`, Raw512]
+      elif `hasSSE`:
+        if SSE: `op_r512_sse`
+        else: `fb`[64, `T`, Raw512]
+      else:
+        `fb`[64, `T`, Raw512]
+
+    template `op`*(a: ptr `T`): `r128` =
+      when defined(useSSE):
+        cast[`r128`](`op_r128_sse`(a))
+      else:
+        cast[`r128`](`op_x86_128`(a))
+
+    template `op`*(a: ptr `T`): `r256` =
+      when defined(useAVX):
+        cast[`r256`](`op_r256_avx`(a))
+      elif defined(useSSE):
+        cast[`r256`](`op_r256_sse`(a))
+      else:
+        cast[`r256`](`op_x86_256`(a))
+
+    template `op`*(a: ptr `T`): `r512` =
+      when defined(useAVX512):
+        cast[`r512`](`op_r512_avx512`(a))
+      elif defined(useAVX):
+        cast[`r512`](`op_r512_avx`(a))
+      elif defined(useSSE):
+        cast[`r512`](`op_r512_sse`(a))
+      else:
+        cast[`r512`](`op_x86_512`(a))
+
 # =============================================================================
 # Final generation macro
 # =============================================================================
@@ -3237,6 +3459,52 @@ macro generateSimdCode*(): untyped =
     let dtype: string = combo.dtype
     let fb = getExpr("fallback", op, dtype)
 
+    if fb.kind == nnkIdent and $fb == "error":
+      let short = case dtype
+        of "float32": "f32"
+        of "float64": "f64"
+        of "int8": "i8"
+        of "int16": "i16"
+        of "int32": "i32"
+        of "int64": "i64"
+        of "uint8": "u8"
+        of "uint16": "u16"
+        of "uint32": "u32"
+        of "uint64": "u64"
+        else: dtype
+
+      let r128 = ident(short & "r128")
+      let r256 = ident(short & "r256")
+      let r512 = ident(short & "r512")
+      let opIdent = ident(op)
+      let T_node = ident(dtype)
+
+      if isMask:
+        let maskShort = maskShortName(dtype)
+        let mr128 = ident(maskShort & "r128")
+        let mr256 = ident(maskShort & "r256")
+        let mr512 = ident(maskShort & "r512")
+        result.add quote do:
+          template `opIdent`*(a, b: `r128`): `mr128` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a, b: `r256`): `mr256` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a, b: `r512`): `mr512` {.error: "Unsupported Operator".} = discard
+      elif arity == 1:
+        result.add quote do:
+          template `opIdent`*(a: `r128`): `r128` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a: `r256`): `r256` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a: `r512`): `r512` {.error: "Unsupported Operator".} = discard
+      elif arity == 0:
+        result.add quote do:
+          template `opIdent`*(a: ptr `T_node`): `r128` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a: ptr `T_node`): `r256` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a: ptr `T_node`): `r512` {.error: "Unsupported Operator".} = discard
+      else:
+        result.add quote do:
+          template `opIdent`*(a, b: `r128`): `r128` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a, b: `r256`): `r256` {.error: "Unsupported Operator".} = discard
+          template `opIdent`*(a, b: `r512`): `r512` {.error: "Unsupported Operator".} = discard
+      continue
+
     if isNoneNode(fb):
       error("fallback is required for SIMD op `" & op & "` / " & dtype)
 
@@ -3254,7 +3522,6 @@ macro generateSimdCode*(): untyped =
       let avx512 = getExpr("avx512", op, dtype)
 
       if isLoad:
-        # Load는 mask128/256 불필요, fb만 사용
         result.add emitLoadX86(ident(op), getDTypeNode("sse", op, dtype), sse, avx, avx512, fb)
       elif isMask:
         let mask128 = getExpr("mask128", op, dtype)
@@ -3386,17 +3653,22 @@ proc maskOneGen(name, op, C1, C2, T1, T2: NimNode): NimNode =
 macro opOneGen(op, T, code: untyped): untyped =
   result = quote do:
     func `op`(a: `T`): `T` =
-      code
+      `code`
 
 macro opTwoGen(op, T, code: untyped): untyped =
   result = quote do:
     func `op`(a, b: `T`): `T` =
-      code
+      `code`
 
 macro opTwoDiffGen(op, T1, T2, T3, code: untyped): untyped =
   result = quote do:
     func `op`(a: `T1`, b: `T2`): `T3` =
-      code
+      `code`
+
+macro opLoadGen(op, S, T, code: untyped): untyped =
+  result = quoted do:
+    func `op`(a: `S`): `T` =
+      `code`
 
 #[
 template typeGen(name, op, C, T: untyped): NimNode =
@@ -3996,178 +4268,275 @@ simdInput("sse"):
     uint32: mm_xor_si128
     uint64: mm_xor_si128
   `nand`:
-    float32: opTwoGen(`nand`, sse.M128, nandX86Gen(mm_set1_epi32, mm_and_ps, mm_xor_ps, sse.M128))
-    float64: opTwoGen(`nand`, sse.M128d, nandX86Gen(mm_set1_epi32, mm_and_pd, mm_xor_pd, sse2.M128d))
-    int8: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    int16: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    int32: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    int64: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    uint8: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    uint16: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    uint32: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
-    uint64: opTwoGen(`nand`, sse.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    float32: opTwoGen(nand_sse_f32, sse.M128, nandX86Gen(mm_set1_epi32, mm_and_ps, mm_xor_ps, sse.M128))
+    float64: opTwoGen(nand_sse_f64, sse2.M128d, nandX86Gen(mm_set1_epi32, mm_and_pd, mm_xor_pd, sse2.M128d))
+    int8: opTwoGen(nand_sse_i8, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    int16: opTwoGen(nand_sse_i16, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    int32: opTwoGen(nand_sse_i32, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    int64: opTwoGen(nand_sse_i64, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    uint8: opTwoGen(nand_sse_u8, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    uint16: opTwoGen(nand_sse_u16, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    uint32: opTwoGen(nand_sse_u32, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
+    uint64: opTwoGen(nand_sse_u64, sse2.M128i, nandX86Gen(mm_set1_epi32, mm_and_si128, mm_xor_si128, sse2.M128i))
   `nor`:
-    float32: opTwoGen(`nor`, sse.M128, norX86Gen(mm_set1_epi32, mm_or_ps, mm_xor_ps, sse.M128))
-    float64: opTwoGen(`nor`, sse.M128d, norX86Gen(mm_set1_epi32, mm_or_pd, mm_xor_pd, sse2.M128d))
-    int8: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int16: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int32: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int64: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint8: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint16: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint32: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint64: opTwoGen(`nor`, sse.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    float32: opTwoGen(nor_sse_f32, sse.M128, norX86Gen(mm_set1_epi32, mm_or_ps, mm_xor_ps, sse.M128))
+    float64: opTwoGen(nor_sse_f64, sse2.M128d, norX86Gen(mm_set1_epi32, mm_or_pd, mm_xor_pd, sse2.M128d))
+    int8: opTwoGen(nor_sse_i8, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int16: opTwoGen(nor_sse_i16, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int32: opTwoGen(nor_sse_i32, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int64: opTwoGen(nor_sse_i64, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint8: opTwoGen(nor_sse_u8, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint16: opTwoGen(nor_sse_u16, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint32: opTwoGen(nor_sse_u32, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint64: opTwoGen(nor_sse_u64, sse2.M128i, norX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
   `nxor`:
-    float32: opTwoGen(`nxor`, sse.M128, nxorX86Gen(mm_set1_epi32, mm_xor_ps, sse.M128))
-    float64: opTwoGen(`nxor`, sse2.M128d, nxorX86Gen(mm_set1_epi32, mm_xor_pd, sse2.M128d))
-    int8: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    int16: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    int32: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    int64: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    uint8: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    uint16: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    uint32: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
-    uint64: opTwoGen(`nxor`, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    float32: opTwoGen(nxor_sse_f32, sse.M128, nxorX86Gen(mm_set1_epi32, mm_xor_ps, sse.M128))
+    float64: opTwoGen(nxor_sse_f64, sse2.M128d, nxorX86Gen(mm_set1_epi32, mm_xor_pd, sse2.M128d))
+    int8: opTwoGen(nxor_sse_i8, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    int16: opTwoGen(nxor_sse_i16, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    int32: opTwoGen(nxor_sse_i32, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    int64: opTwoGen(nxor_sse_i64, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    uint8: opTwoGen(nxor_sse_u8, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    uint16: opTwoGen(nxor_sse_u16, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    uint32: opTwoGen(nxor_sse_u32, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
+    uint64: opTwoGen(nxor_sse_u64, sse2.M128i, nxorX86Gen(mm_set1_epi32, mm_xor_si128, sse2.M128i))
   `andnot`:
-    float32: opTwoGen(`andnot`, sse.M128, andnotX86Gen(mm_andnot_ps))
-    float64: opTwoGen(`andnot`, sse2.M128d, andnotX86Gen(mm_andnot_pd))
-    int8: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    int16: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    int32: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    int64: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    uint8: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    uint16: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    uint32: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
-    uint64: opTwoGen(`andnot`, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    float32: opTwoGen(andnot_sse_f32, sse.M128, andnotX86Gen(mm_andnot_ps))
+    float64: opTwoGen(andnot_sse_f64, sse2.M128d, andnotX86Gen(mm_andnot_pd))
+    int8: opTwoGen(andnot_sse_i8, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    int16: opTwoGen(andnot_sse_i16, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    int32: opTwoGen(andnot_sse_i32, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    int64: opTwoGen(andnot_sse_i64, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    uint8: opTwoGen(andnot_sse_u8, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    uint16: opTwoGen(andnot_sse_u16, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    uint32: opTwoGen(andnot_sse_u32, sse2.M128i, andnotX86Gen(mm_andnot_si128))
+    uint64: opTwoGen(andnot_sse_u64, sse2.M128i, andnotX86Gen(mm_andnot_si128))
   `ornot`:
-    float32: opTwoGen(`ornot`, sse.M128, ornotX86Gen(mm_set1_epi32, mm_or_ps, mm_xor_ps, sse.M128))
-    float64: opTwoGen(`ornot`, sse2.M128d, ornotX86Gen(mm_set1_epi32, mm_or_pd, mm_xor_pd, sse2.M128d))
-    int8: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int16: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int32: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    int64: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint8: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint16: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint32: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
-    uint64: opTwoGen(`ornot`, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    float32: opTwoGen(ornot_sse_f32, sse.M128, ornotX86Gen(mm_set1_epi32, mm_or_ps, mm_xor_ps, sse.M128))
+    float64: opTwoGen(ornot_sse_f64, sse2.M128d, ornotX86Gen(mm_set1_epi32, mm_or_pd, mm_xor_pd, sse2.M128d))
+    int8: opTwoGen(ornot_sse_i8, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int16: opTwoGen(ornot_sse_i16, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int32: opTwoGen(ornot_sse_i32, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    int64: opTwoGen(ornot_sse_i64, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint8: opTwoGen(ornot_sse_u8, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint16: opTwoGen(ornot_sse_u16, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint32: opTwoGen(ornot_sse_u32, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
+    uint64: opTwoGen(ornot_sse_u64, sse2.M128i, ornotX86Gen(mm_set1_epi32, mm_or_si128, mm_xor_si128, sse2.M128i))
   `shl`:
-    float32: typeGen(`shl_sse_f32`, mm_sll_epi32, sse.M128, sse2.M128i)
-    float64: typeGen(`shl_sse_f64`, mm_sll_epi64, sse2.M128d, sse2.M128i)
-    int8: opTwoGen(`shl`, sse2.M128i, shlX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sll_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
+    float32: typeGen(shl_sse_f32, mm_sll_epi32, sse.M128, sse2.M128i)
+    float64: typeGen(shl_sse_f64, mm_sll_epi64, sse2.M128d, sse2.M128i)
+    int8: opTwoGen(shl_sse_i8, sse2.M128i, shlX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sll_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
     int16: mm_sll_epi16
     int32: mm_sll_epi32
     int64: mm_sll_epi64
-    int8: opTwoGen(`shl`, sse2.M128i, shlX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sll_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
-    int16: mm_sll_epi16
-    int32: mm_sll_epi32
-    int64: mm_sll_epi64
+    uint8: opTwoGen(shl_sse_u8, sse2.M128i, shlX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sll_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
+    uint16: mm_sll_epi16
+    uint32: mm_sll_epi32
+    uint64: mm_sll_epi64
   `shr`:
-    float32: typeGen(`shr_sse_f32`, mm_srl_epi32, sse.M128, sse2.M128i)
-    float64: typeGen(`shr_sse_f64`, mm_srl_epi64, sse2.M128d, sse2.M128i)
-    int8: opTwoGen(`shl`, sse2.M128i, shrX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sra_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
+    float32: typeGen(shr_sse_f32, mm_srl_epi32, sse.M128, sse2.M128i)
+    float64: typeGen(shr_sse_f64, mm_srl_epi64, sse2.M128d, sse2.M128i)
+    int8: opTwoGen(shr_sse_i8, sse2.M128i, shrX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_sra_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
     int16: mm_sra_epi16
     int32: mm_sra_epi32
     int64: none
-    uint8: opTwoGen(`shl`, sse2.M128i, shrX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_srl_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
+    uint8: opTwoGen(shr_sse_u8, sse2.M128i, shrX86Gen(mm_unpacklo_epi8, mm_unpackhi_epi8, mm_srl_epi16, mm_and_si128, mm_set1_epi16, mm_packus_epi16, sse2.M128i))
     uint16: mm_srl_epi16
     uint32: mm_srl_epi32
     uint64: mm_srl_epi64
+  `min`:
+    float32: mm_min_ps
+    float64: mm_min_pd
+    int8: mm_min_epi8
+    int16: mm_min_epi16
+    int32: mm_min_epi32
+    int64: none
+    uint8: mm_min_epu8
+    uint16: mm_min_epu16
+    uint32: mm_min_epu32
+    uint64: none
+  `max`:
+    float32: mm_max_ps
+    float64: mm_max_pd
+    int8: mm_max_epi8
+    int16: mm_max_epi16
+    int32: mm_max_epi32
+    int64: none
+    uint8: mm_max_epu8
+    uint16: mm_max_epu16
+    uint32: mm_max_epu32
+    uint64: none
 
 simdUnaryInput("sse"):
   `not`:
-    float32: opOneGen(`not`, sse.M128, notX86Gen(mm_xor_ps, mm_set1_epi32, sse.M128))
-    float64: opOneGen(`not`, sse2.M128d, notX86Gen(mm_xor_pd, mm_set1_epi32, sse2.M128d))
-    int8: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    int16: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    int32: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    int64: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi64x, sse2.M128i))
-    uint8: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    uint16: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    uint32: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    uint64: opOneGen(`not`, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi64x, sse2.M128i))
+    float32: opOneGen(not_sse_f32, sse.M128, notX86Gen(mm_xor_ps, mm_set1_epi32, sse.M128))
+    float64: opOneGen(not_sse_f64, sse2.M128d, notX86Gen(mm_xor_pd, mm_set1_epi32, sse2.M128d))
+    int8: opOneGen(not_sse_i8, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    int16: opOneGen(not_sse_i16, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    int32: opOneGen(not_sse_i32, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    int64: opOneGen(not_sse_i64, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi64x, sse2.M128i))
+    uint8: opOneGen(not_sse_u8, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    uint16: opOneGen(not_sse_u16, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    uint32: opOneGen(not_sse_u32, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    uint64: opOneGen(not_sse_u64, sse2.M128i, notX86Gen(mm_xor_si128, mm_set1_epi64x, sse2.M128i))
   `abs`:
-    float32: opOneGen(`abs`, sse.M128, absFloatX86Gen(mm_set1_ps, (-0.0'f32), mm_andnot_ps, sse.M128))
-    float64: opOneGen(`abs`, sse2.M128d, absFloatX86Gen(mm_set1_pd, (-0.0'f64), mm_andnot_pd, sse2.M128d))
-    int8: opOneGen(`abs`, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi8, mm_xor_si128, mm_sub_epi8, sse2.M128i))
-    int16: opOneGen(`abs`, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi16, mm_xor_si128, mm_sub_epi16, sse2.M128i))
-    int32: opOneGen(`abs`, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi32, mm_xor_si128, mm_sub_epi32, sse2.M128i))
-    int64: opOneGen(`abs`, sse2.M128i, absInt64X86Gen(mm_srli_epi64, mm_setzero_si128, mm_sub_epi64, mm_xor_si128, sse2.M128i))
-    uint8: opOneGen(`abs`, sse2.M128i, absUintX86Gen())
-    uint16: opOneGen(`abs`, sse2.M128i, absUintX86Gen())
-    uint32: opOneGen(`abs`, sse2.M128i, absUintX86Gen())
-    uint64: opOneGen(`abs`, sse2.M128i, absUintX86Gen())
+    float32: opOneGen(abs_sse_f32, sse.M128, absFloatX86Gen(mm_set1_ps, (-0.0'f32), mm_andnot_ps, sse.M128))
+    float64: opOneGen(abs_sse_f64, sse2.M128d, absFloatX86Gen(mm_set1_pd, (-0.0'f64), mm_andnot_pd, sse2.M128d))
+    int8: opOneGen(abs_sse_i8, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi8, mm_xor_si128, mm_sub_epi8, sse2.M128i))
+    int16: opOneGen(abs_sse_i16, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi16, mm_xor_si128, mm_sub_epi16, sse2.M128i))
+    int32: opOneGen(abs_sse_i32, sse2.M128i, absIntX86Gen(mm_setzero_si128, mm_cmpgt_epi32, mm_xor_si128, mm_sub_epi32, sse2.M128i))
+    int64: opOneGen(abs_sse_i64, sse2.M128i, absInt64X86Gen(mm_srli_epi64, mm_setzero_si128, mm_sub_epi64, mm_xor_si128, sse2.M128i))
+    uint8: opOneGen(abs_sse_u8, sse2.M128i, absUintX86Gen())
+    uint16: opOneGen(abs_sse_u16, sse2.M128i, absUintX86Gen())
+    uint32: opOneGen(abs_sse_u32, sse2.M128i, absUintX86Gen())
+    uint64: opOneGen(abs_sse_u64, sse2.M128i, absUintX86Gen())
+  `sqrt`:
+    float32: mm_sqrt_ps
+    float64: mm_sqrt_pd
+    int8: error
+    int16: error
+    int32: error
+    int64: error
+    uint8: error
+    uint16: error
+    uint32: error
+    uint64: error
 
 simdMaskInput("sse"):
- `==`:
+  `==`:
     float32: mm_cmpeq_ps
     float64: mm_cmpeq_pd
     int8: mm_cmpeq_epi8
     int16: mm_cmpeq_epi16
     int32: mm_cmpeq_epi32
-    int64: opTwoGen(`==`, sse2.M128i, cmpeqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_setzero_si128, sse2.M128i))
+    int64: opTwoGen(cmpeq_sse_i64, sse2.M128i, cmpeqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_setzero_si128, sse2.M128i))
     uint8: mm_cmpeq_epi8
     uint16: mm_cmpeq_epi16
     uint32: mm_cmpeq_epi32
-    uint64: opTwoGen(`==`, sse2.M128i, cmpeqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_setzero_si128, sse2.M128i))
+    uint64: opTwoGen(cmpeq_sse_u64, sse2.M128i, cmpeqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_setzero_si128, sse2.M128i))
   `!=`:
     float32: mm_cmpneq_ps
     float64: mm_cmpneq_pd
-    int8: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi8, mm_cmpeq_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    int16: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi16, mm_cmpeq_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    int32: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi32, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    int64: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    uint8: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi8, mm_cmpeq_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    uint16: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi16, mm_cmpeq_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    uint32: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi32, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    uint64: opTwoGen(`!=`, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi64x, sse2.M128i))
+    int8: opTwoGen(cmpneq_sse_i8, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi8, mm_cmpeq_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    int16: opTwoGen(cmpneq_sse_i16, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi16, mm_cmpeq_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    int32: opTwoGen(cmpneq_sse_i32, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi32, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    int64: opTwoGen(cmpneq_sse_i64, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    uint8: opTwoGen(cmpneq_sse_u8, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi8, mm_cmpeq_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    uint16: opTwoGen(cmpneq_sse_u16, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi16, mm_cmpeq_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    uint32: opTwoGen(cmpneq_sse_u32, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi32, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    uint64: opTwoGen(cmpneq_sse_u64, sse2.M128i, cmpneqSubX86Gen(mm_sub_epi64, mm_cmpeq_epi32, mm_xor_si128, mm_set1_epi64x, sse2.M128i))
   `<`:
     float32: mm_cmplt_ps
     float64: mm_cmplt_pd
     int8: mm_cmplt_epi8
     int16: mm_cmplt_epi16
     int32: mm_cmplt_epi32
-    int64: opTwoGen(`<`, sse2.M128i, cmpltIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, 63, sse2.M128i))
-    uint8: opTwoGen(`<`, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), sse2.M128i))
-    uint16: opTwoGen(`<`, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), sse2.M128i))
-    uint32: opTwoGen(`<`, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), sse2.M128i))
-    uint64: opTwoGen(`<`, sse2.M128i, cmpltSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    int64: opTwoGen(cmplt_sse_i64, sse2.M128i, cmpltIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, 63, sse2.M128i))
+    uint8: opTwoGen(cmplt_sse_u8, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), sse2.M128i))
+    uint16: opTwoGen(cmplt_sse_u16, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), sse2.M128i))
+    uint32: opTwoGen(cmplt_sse_u32, sse2.M128i, cmpltUintX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), sse2.M128i))
+    uint64: opTwoGen(cmplt_sse_u64, sse2.M128i, cmpltSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
   `>`:
     float32: mm_cmpgt_ps
     float64: mm_cmpgt_pd
     int8: mm_cmpgt_epi8
     int16: mm_cmpgt_epi16
     int32: mm_cmpgt_epi32
-    int64: opTwoGen(`>`, sse2.M128i, cmpgtIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, 63, sse2.M128i))
-    uint8: opTwoGen(`>`, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), sse2.M128i))
-    uint16: opTwoGen(`>`, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), sse2.M128i))
-    uint32: opTwoGen(`>`, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), sse2.M128i))
-    uint64: opTwoGen(`>`, sse2.M128i, cmpgtSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    int64: opTwoGen(cmpgt_sse_i64, sse2.M128i, cmpgtIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, 63, sse2.M128i))
+    uint8: opTwoGen(cmpgt_sse_u8, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), sse2.M128i))
+    uint16: opTwoGen(cmpgt_sse_u16, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), sse2.M128i))
+    uint32: opTwoGen(cmpgt_sse_u32, sse2.M128i, cmpgtUintX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), sse2.M128i))
+    uint64: opTwoGen(cmpgt_sse_u64, sse2.M128i, cmpgtSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
   `<=`:
     float32: mm_cmple_ps
     float64: mm_cmple_pd
-    int8: opTwoGen(`<=`, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    int16: opTwoGen(`<=`, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    int32: opTwoGen(`<=`, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    int64: opTwoGen(`<=`, sse2.M128i, cmpleSubIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
-    uint8: opTwoGen(`<=`, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), mm_set1_epi8, sse2.M128i))
-    uint16: opTwoGen(`<=`, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), mm_set1_epi16, sse2.M128i))
-    uint32: opTwoGen(`<=`, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), mm_set1_epi32, sse2.M128i))
-    uint64: opTwoGen(`<=`, sse2.M128i, cmpleSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    int8: opTwoGen(cmple_sse_i8, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    int16: opTwoGen(cmple_sse_i16, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    int32: opTwoGen(cmple_sse_i32, sse2.M128i, cmpleIntX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    int64: opTwoGen(cmple_sse_i64, sse2.M128i, cmpleSubIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    uint8: opTwoGen(cmple_sse_u8, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), mm_set1_epi8, sse2.M128i))
+    uint16: opTwoGen(cmple_sse_u16, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), mm_set1_epi16, sse2.M128i))
+    uint32: opTwoGen(cmple_sse_u32, sse2.M128i, cmpleUintX86Gen(mm_cmpgt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), mm_set1_epi32, sse2.M128i))
+    uint64: opTwoGen(cmple_sse_u64, sse2.M128i, cmpleSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
   `>=`:
     float32: mm_cmpge_ps
     float64: mm_cmpge_pd
-    int8: opTwoGen(`>=`, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
-    int16: opTwoGen(`>=`, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
-    int32: opTwoGen(`>=`, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
-    int64: opTwoGen(`>=`, sse2.M128i, cmpgeSubIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
-    uint8: opTwoGen(`>=`, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), mm_set1_epi8, sse2.M128i))
-    uint16: opTwoGen(`>=`, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), mm_set1_epi16, sse2.M128i))
-    uint32: opTwoGen(`>=`, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), mm_set1_epi32, sse2.M128i))
-    uint64: opTwoGen(`>=`, sse2.M128i, cmpgeSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    int8: opTwoGen(cmpge_sse_i8, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, sse2.M128i))
+    int16: opTwoGen(cmpge_sse_i16, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, sse2.M128i))
+    int32: opTwoGen(cmpge_sse_i32, sse2.M128i, cmpgeIntX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, sse2.M128i))
+    int64: opTwoGen(cmpge_sse_i64, sse2.M128i, cmpgeSubIntX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+    uint8: opTwoGen(cmpge_sse_u8, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi8, mm_xor_si128, mm_set1_epi8, cast[int8](0x80'u8), mm_set1_epi8, sse2.M128i))
+    uint16: opTwoGen(cmpge_sse_u16, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi16, mm_xor_si128, mm_set1_epi16, cast[int16](0x8000'u16), mm_set1_epi16, sse2.M128i))
+    uint32: opTwoGen(cmpge_sse_u32, sse2.M128i, cmpgeUintX86Gen(mm_cmplt_epi32, mm_xor_si128, mm_set1_epi32, cast[int32](0x80000000'u32), mm_set1_epi32, sse2.M128i))
+    uint64: opTwoGen(cmpge_sse_u64, sse2.M128i, cmpgeSubUintX86Gen(mm_sub_epi64, mm_xor_si128, mm_and_si128, mm_or_si128, mm_srli_epi64, mm_set1_epi64x, 63, sse2.M128i))
+
+macro iloadX86Gen(load_inst, T: untyped): untyped =
+  result = quote do:
+    `load_inst`(cast[ptr `T`](a))
+
+macro iLoad1BHX86Gen(cvt_inst, unpacklos_inst, unpacklob_inst, shuffle_inst: untyped): untyped =
+  result = quote do:
+    let v = `cvt_inst`(cast[ptr int32](a)[])
+    let w1 = `unpacklos_inst`(v, v)
+    let w2 = `unpacklob_inst`(w1, w1)
+    return `shuffle_inst`(w2, 0)
+
+macro iLoad1WX86Gen(cvt_inst, shuffle_inst: untyped): untyped =
+  result = quote do:
+    let v = `cvt_inst`(cast[ptr int32](a)[])
+    return `shuffle_inst`(v, 0)
+
+macro iLoad1DX86Gen(loadl_inst, unpacklo_inst, T: untyped): untyped =
+  result = quote do:
+    let q = `loadl_inst`(cast[ptr `T`](a))
+    return mm_unpacklo_epi64(q, q)
+
+macro iLoad1CVTX86Gen(broadcast_inst, cvt_inst: untyped): untyped =
+  result = quote do:
+    return `broadcast_inst`(`cvt_inst`(cast[ptr int32](a)[]))
+
+macro iLoad1LoadX86Gen(broadcast_inst, load_inst: untyped): untyped =
+  result = quote do:
+    return `broadcast_inst`(`load_inst`(cast[ptr sse2.M128i](a)))
+
+macro fLoad1LoadX86Gen(broadcast_inst, load_inst: untyped): untyped =
+  result = quote do:
+    return `broadcast_inst`(`load_inst`(a))
 
 simdLoadInput("sse"):
   loadU:
-
+    float32: mm_loadu_ps
+    float64: mm_loadu_pd
+    int8: opLoadGen(loadU_sse_i8, ptr int8, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    int16: opLoadGen(loadU_sse_i16, ptr int16, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    int32: opLoadGen(loadU_sse_i32, ptr int32, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    int64: opLoadGen(loadU_sse_i64, ptr int64, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    uint8: opLoadGen(loadU_sse_u8, ptr uint8, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    uint16: opLoadGen(loadU_sse_u16, ptr uint16, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    uint32: opLoadGen(loadU_sse_u32, ptr uint32, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+    uint64: opLoadGen(loadU_sse_u64, ptr uint64, M128i, iLoadX86Gen(mm_loadu_si128, M128i))
+  loadA:
+    float32: mm_load_ps
+    float64: mm_load_pd
+    int8: opLoadGen(loadA_sse_i8, ptr int8, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    int16: opLoadGen(loadA_sse_i16, ptr int16, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    int32: opLoadGen(loadA_sse_i32, ptr int32, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    int64: opLoadGen(loadA_sse_i64, ptr int64, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    uint8: opLoadGen(loadA_sse_u8, ptr uint8, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    uint16: opLoadGen(loadA_sse_u16, ptr uint16, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    uint32: opLoadGen(loadA_sse_u32, ptr uint32, M128i, iLoadX86Gen(mm_load_si128, M128i))
+    uint64: opLoadGen(loadA_sse_u64, ptr uint64, M128i, iLoadX86Gen(mm_load_si128, M128i))
+  load1:
+    float32: mm_load1_ps
+    float64: mm_load1_pd
+    int8: opLoadGen(load1_sse_i8, ptr int8, sse2.M128i, iLoad1BHX86Gen(mm_cvtsi32_si128, mm_unpacklo_epi8, mm_unpacklo_epi16, mm_shuffle_epi32))
+    int16: opLoadGen(load1_sse_i16, ptr int16, sse2.M128i, iLoad1BHX86Gen(mm_cvtsi32_si128, mm_unpacklo_epi16, mm_unpacklo_epi32, mm_shuffle_epi32))
+    int32: opLoadGen(load1_sse_i32, ptr int32, sse2.M128i, iLoad1WX86Gen(mm_cvtsi32_si128, mm_shuffle_epi32))
+    int64: opLoadGen(load1_sse_i64, ptr int64, sse2.M128i, iLoad1DX86Gen(mm_loadl_epi64, mm_unpacklo_epi64, sse2.M128i))
+    uint8: opLoadGen(load1_sse_u8, ptr uint8, sse2.M128i, iLoad1BHX86Gen(mm_cvtsi32_si128, mm_unpacklo_epi8, mm_unpacklo_epi16, mm_shuffle_epi32))
+    uint16: opLoadGen(load1_sse_u16, ptr uint16, sse2.M128i, iLoad1BHX86Gen(mm_cvtsi32_si128, mm_unpacklo_epi16, mm_unpacklo_epi32, mm_shuffle_epi32))
+    uint32: opLoadGen(load1_sse_u32, ptr uint32, sse2.M128i, iLoad1WX86Gen(mm_cvtsi32_si128, mm_shuffle_epi32))
+    uint64: opLoadGen(load1_sse_u64, ptr uint64, sse2.M128i, iLoad1DX86Gen(mm_loadl_epi64, mm_unpacklo_epi64, sse2.M128i))
 
 # x86: AVX
 simdInput("avx"):
@@ -4238,38 +4607,38 @@ simdInput("avx"):
     uint32: mm256_xor_si256
     uint64: mm256_xor_si256
   `nand`:
-    float32: opTwoGen(`nand`, avx.M256, nandX86Gen(mm256_set1_epi32, mm256_and_ps, mm256_xor_ps, avx.M256))
-    float64: opTwoGen(`nand`, avx.M256d, nandX86Gen(mm256_set1_epi32, mm256_and_pd, mm256_xor_pd, avx.M256d))
-    int8: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    int16: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    int32: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    int64: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    uint8: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    uint16: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    uint32: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
-    uint64: opTwoGen(`nand`, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    float32: opTwoGen(nand_avx_f32, avx.M256, nandX86Gen(mm256_set1_epi32, mm256_and_ps, mm256_xor_ps, avx.M256))
+    float64: opTwoGen(nand_avx_f64, avx.M256d, nandX86Gen(mm256_set1_epi32, mm256_and_pd, mm256_xor_pd, avx.M256d))
+    int8: opTwoGen(nand_avx_i8, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    int16: opTwoGen(nand_avx_i16, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    int32: opTwoGen(nand_avx_i32, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    int64: opTwoGen(nand_avx_i64, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    uint8: opTwoGen(nand_avx_u8, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    uint16: opTwoGen(nand_avx_u16, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    uint32: opTwoGen(nand_avx_u32, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
+    uint64: opTwoGen(nand_avx_u64, avx.M256i, nandX86Gen(mm256_set1_epi32, mm256_and_si256, mm256_xor_si256, avx.M256i))
   `nor`:
-    float32: opTwoGen(`nor`, avx.M256, norX86Gen(mm256_set1_epi32, mm256_or_ps, mm256_xor_ps, avx.M256))
-    float64: opTwoGen(`nor`, avx.M256d, norX86Gen(mm256_set1_epi32, mm256_or_ps, mm256_xor_ps, avx.M256d))
-    int8: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    int16: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    int32: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    int64: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    uint8: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    uint16: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    uint32: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
-    uint64: opTwoGen(`nor`, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    float32: opTwoGen(nor_avx_f32, avx.M256, norX86Gen(mm256_set1_epi32, mm256_or_ps, mm256_xor_ps, avx.M256))
+    float64: opTwoGen(nor_avx_f64, avx.M256d, norX86Gen(mm256_set1_epi32, mm256_or_pd, mm256_xor_pd, avx.M256d))
+    int8: opTwoGen(nor_avx_i8, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    int16: opTwoGen(nor_avx_i16, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    int32: opTwoGen(nor_avx_i32, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    int64: opTwoGen(nor_avx_i64, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    uint8: opTwoGen(nor_avx_u8, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    uint16: opTwoGen(nor_avx_u16, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    uint32: opTwoGen(nor_avx_u32, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
+    uint64: opTwoGen(nor_avx_u64, avx.M256i, norX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx.M256i))
   `nxor`:
-    float32: opTwoGen(`nxor`, avx.M256, nxorX86Gen(mm256_set1_epi32, mm256_xor_ps, avx.M256))
-    float64: opTwoGen(`nxor`, avx.M256d,nxorX86Gen(mm256_set1_epi32, mm256_xor_pd, avx.M256d))
-    int8: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    int16: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    int32: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    int64: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    uint8: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    uint16: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    uint32: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
-    uint64: opTwoGen(`nxor`, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    float32: opTwoGen(nxor_avx_f32, avx.M256, nxorX86Gen(mm256_set1_epi32, mm256_xor_ps, avx.M256))
+    float64: opTwoGen(nxor_avx_f64, avx.M256d, nxorX86Gen(mm256_set1_epi32, mm256_xor_pd, avx.M256d))
+    int8: opTwoGen(nxor_avx_i8, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    int16: opTwoGen(nxor_avx_i16, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    int32: opTwoGen(nxor_avx_i32, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    int64: opTwoGen(nxor_avx_i64, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    uint8: opTwoGen(nxor_avx_u8, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    uint16: opTwoGen(nxor_avx_u16, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    uint32: opTwoGen(nxor_avx_u32, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
+    uint64: opTwoGen(nxor_avx_u64, avx.M256i, nxorX86Gen(mm256_set1_epi32, mm256_xor_si256, avx.M256i))
   `andnot`:
     float32: mm256_andnot_ps
     float64: mm256_andnot_pd
@@ -4282,62 +4651,95 @@ simdInput("avx"):
     uint32: mm256_andnot_si256
     uint64: mm256_andnot_si256
   `ornot`:
-    float32: opTwoGen(`ornot`, avx.M256, ornotX86Gen(mm256_set1_epi32, mm256_or_ps, mm256_xor_ps, avx.M256))
-    float64: opTwoGen(`ornot`, avx.M256d, ornotX86Gen(mm256_set1_epi32, mm256_or_pd, mm256_xor_pd, avx.M256d))
-    int8: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    int16: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    int32: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    int64: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    uint8: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    uint16: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    uint32: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
-    uint64: opTwoGen(`ornot`, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    float32: opTwoGen(ornot_avx_f32, avx.M256, ornotX86Gen(mm256_set1_epi32, mm256_or_ps, mm256_xor_ps, avx.M256))
+    float64: opTwoGen(ornot_avx_f64, avx.M256d, ornotX86Gen(mm256_set1_epi32, mm256_or_pd, mm256_xor_pd, avx.M256d))
+    int8: opTwoGen(ornot_avx_i8, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    int16: opTwoGen(ornot_avx_i16, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    int32: opTwoGen(ornot_avx_i32, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    int64: opTwoGen(ornot_avx_i64, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    uint8: opTwoGen(ornot_avx_u8, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    uint16: opTwoGen(ornot_avx_u16, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    uint32: opTwoGen(ornot_avx_u32, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
+    uint64: opTwoGen(ornot_avx_u64, avx2.M256i, ornotX86Gen(mm256_set1_epi32, mm256_or_si256, mm256_xor_si256, avx2.M256i))
   `shl`:
-    float32: typeGen(`shl_avx_f32`, mm256_sll_epi32, avx.M256, avx.M256i)
-    float64: typeGen(`shl_avx_f64`, mm256_sll_epi64, avx.M256d, avx.M256i)
-    int8: opTwoGen(`shl`, avx.M256i, shlX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sll_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
+    float32: typeGen(shl_avx_f32, mm256_sll_epi32, avx.M256, avx.M256i)
+    float64: typeGen(shl_avx_f64, mm256_sll_epi64, avx.M256d, avx.M256i)
+    int8: opTwoGen(shl_avx_i8, avx.M256i, shlX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sll_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
     int16: mm256_sll_epi16
     int32: mm256_sll_epi32
     int64: mm256_sll_epi64
-    uint8: opTwoGen(`shl`, avx.M256i, shlX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sll_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
+    uint8: opTwoGen(shl_avx_u8, avx.M256i, shlX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sll_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
     uint16: mm256_sll_epi16
     uint32: mm256_sll_epi32
     uint64: mm256_sll_epi64
   `shr`:
-    float32: typeGen(`shr_avx_f32`, mm256_srl_epi32, avx.M256, avx.M256i)
-    float64: typeGen(`shr_avx_f64`, mm256_srl_epi64, avx.M256d, avx.M256i)
-    int8: opTwoGen(`shr`, avx.M256i, shrX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sra_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
+    float32: typeGen(shr_avx_f32, mm256_srl_epi32, avx.M256, avx.M256i)
+    float64: typeGen(shr_avx_f64, mm256_srl_epi64, avx.M256d, avx.M256i)
+    int8: opTwoGen(shr_avx_i8, avx.M256i, shrX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_sra_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
     int16: mm256_sra_epi16
     int32: mm256_sra_epi32
     int64: none
-    uint8: opTwoGen(`shr`, avx.M256i, shrX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_srl_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
+    uint8: opTwoGen(shr_avx_u8, avx.M256i, shrX86Gen(mm256_unpacklo_epi8, mm256_unpackhi_epi8, mm256_srl_epi16, mm256_and_si256, mm256_set1_epi16, mm256_packus_epi16, avx.M256i))
     uint16: mm256_srl_epi16
     uint32: mm256_srl_epi32
     uint64: mm256_srl_epi64
+  `min`:
+    float32: mm256_min_ps
+    float64: mm256_min_pd
+    int8: mm256_min_epi8
+    int16: mm256_min_epi16
+    int32: mm256_min_epi32
+    int64: none
+    uint8: mm256_min_epu8
+    uint16: mm256_min_epu16
+    uint32: mm256_min_epu32
+    uint64: none
+  `max`:
+    float32: mm256_max_ps
+    float64: mm256_max_pd
+    int8: mm256_max_epi8
+    int16: mm256_max_epi16
+    int32: mm256_max_epi32
+    int64: none
+    uint8: mm256_max_epu8
+    uint16: mm256_max_epu16
+    uint32: mm256_max_epu32
+    uint64: none
 
 simdUnaryInput("avx"):
   `not`:
-    float32: opOneGen(`not`, avx.M256, notX86Gen(mm256_xor_ps, mm256_set1_epi32, avx.M256))
-    float64: opOneGen(`not`, avx.M256d, notX86Gen(mm256_xor_pd, mm256_set1_epi32, avx.M256d))
-    int8: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    int16: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    int32: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    int64: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi64x, avx.M256i))
-    uint8: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    uint16: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    uint32: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    uint64: opOneGen(`not`, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi64x, avx.M256i))
+    float32: opOneGen(not_avx_f32, avx.M256, notX86Gen(mm256_xor_ps, mm256_set1_epi32, avx.M256))
+    float64: opOneGen(not_avx_f64, avx.M256d, notX86Gen(mm256_xor_pd, mm256_set1_epi32, avx.M256d))
+    int8: opOneGen(not_avx_i8, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    int16: opOneGen(not_avx_i16, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    int32: opOneGen(not_avx_i32, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    int64: opOneGen(not_avx_i64, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi64x, avx.M256i))
+    uint8: opOneGen(not_avx_u8, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    uint16: opOneGen(not_avx_u16, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    uint32: opOneGen(not_avx_u32, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    uint64: opOneGen(not_avx_u64, avx.M256i, notX86Gen(mm256_xor_si256, mm256_set1_epi64x, avx.M256i))
   `abs`:
-    float32: opOneGen(`abs`, avx.M256, absFloatX86Gen(mm256_set1_ps, (-0.0'f32), mm256_andnot_ps, avx.M256))
-    float64: opOneGen(`abs`, avx.M256d, absFloatX86Gen(mm256_set1_pd, (-0.0'f64), mm256_andnot_pd, avx.M256d))
+    float32: opOneGen(abs_avx_f32, avx.M256, absFloatX86Gen(mm256_set1_ps, (-0.0'f32), mm256_andnot_ps, avx.M256))
+    float64: opOneGen(abs_avx_f64, avx.M256d, absFloatX86Gen(mm256_set1_pd, (-0.0'f64), mm256_andnot_pd, avx.M256d))
     int8: mm256_abs_epi8
     int16: mm256_abs_epi16
     int32: mm256_abs_epi32
-    int64: opOneGen(`abs`, avx.M256i, absInt64X86Gen(mm256_srli_epi64, mm256_setzero_si256, mm256_sub_epi64, mm256_xor_si256, avx.M256i))
-    uint8: opOneGen(`abs`, avx.M256i, absUintX86Gen())
-    uint16: opOneGen(`abs`, avx.M256i, absUintX86Gen())
-    uint32: opOneGen(`abs`, avx.M256i, absUintX86Gen())
-    uint64: opOneGen(`abs`, avx.M256i, absUintX86Gen())
+    int64: opOneGen(abs_avx_i64, avx.M256i, absInt64X86Gen(mm256_srli_epi64, mm256_setzero_si256, mm256_sub_epi64, mm256_xor_si256, avx.M256i))
+    uint8: opOneGen(abs_avx_u8, avx.M256i, absUintX86Gen())
+    uint16: opOneGen(abs_avx_u16, avx.M256i, absUintX86Gen())
+    uint32: opOneGen(abs_avx_u32, avx.M256i, absUintX86Gen())
+    uint64: opOneGen(abs_avx_u64, avx.M256i, absUintX86Gen())
+  `sqrt`:
+    float32: mm256_sqrt_ps
+    float64: mm256_sqrt_pd
+    int8: none
+    int16: none
+    int32: none
+    int64: none
+    uint8: none
+    uint16: none
+    uint32: none
+    uint64: error
 
 macro cmpltIntAvx2Gen(cmpgt_inst, T: untyped): untyped =
   result = quote do:
@@ -4349,71 +4751,106 @@ macro cmpFloatAvxGen(cmp_inst, imm8: static int32, T: untyped): untyped =
 
 simdMaskInput("avx"):
   `==`:
-    float32: opTwoGen(`==`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 0, avx.M256))
-    float64: opTwoGen(`==`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 0, avx.M256d))
-    int8: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_setzero_si256, avx.M256i))
-    int16: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_setzero_si256, avx.M256i))
-    int32: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
-    int64: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
-    uint8: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_setzero_si256, avx.M256i))
-    uint16: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_setzero_si256, avx.M256i))
-    uint32: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
-    uint64: opTwoGen(`==`, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
+    float32: opTwoGen(cmpeq_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 0, avx.M256))
+    float64: opTwoGen(cmpeq_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 0, avx.M256d))
+    int8: opTwoGen(cmpeq_avx_i8, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_setzero_si256, avx.M256i))
+    int16: opTwoGen(cmpeq_avx_i16, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_setzero_si256, avx.M256i))
+    int32: opTwoGen(cmpeq_avx_i32, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
+    int64: opTwoGen(cmpeq_avx_i64, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
+    uint8: opTwoGen(cmpeq_avx_u8, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_setzero_si256, avx.M256i))
+    uint16: opTwoGen(cmpeq_avx_u16, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_setzero_si256, avx.M256i))
+    uint32: opTwoGen(cmpeq_avx_u32, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
+    uint64: opTwoGen(cmpeq_avx_u64, avx.M256i, cmpeqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_setzero_si256, avx.M256i))
   `!=`:
-    float32: opTwoGen(`!=`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 12, avx.M256))
-    float64: opTwoGen(`!=`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 12, avx.M256d))
-    int8: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    int16: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    int32: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    int64: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    uint8: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    uint16: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    uint32: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    uint64: opTwoGen(`!=`, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    float32: opTwoGen(cmpneq_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 12, avx.M256))
+    float64: opTwoGen(cmpneq_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 12, avx.M256d))
+    int8: opTwoGen(cmpneq_avx_i8, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    int16: opTwoGen(cmpneq_avx_i16, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    int32: opTwoGen(cmpneq_avx_i32, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    int64: opTwoGen(cmpneq_avx_i64, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    uint8: opTwoGen(cmpneq_avx_u8, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi8, mm256_cmpeq_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    uint16: opTwoGen(cmpneq_avx_u16, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi16, mm256_cmpeq_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    uint32: opTwoGen(cmpneq_avx_u32, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi32, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    uint64: opTwoGen(cmpneq_avx_u64, avx.M256i, cmpneqSubX86Gen(mm256_sub_epi64, mm256_cmpeq_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
   `<`:
-    float32: opTwoGen(`<`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 1, avx.M256))
-    float64: opTwoGen(`<`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 1, avx.M256d))
-    int8: opTwoGen(`<`, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi8, avx.M256i))
-    int16: opTwoGen(`<`, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi16, avx.M256i))
-    int32: opTwoGen(`<`, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi32, avx.M256i))
-    int64: opTwoGen(`<`, avx.M256i, cmpltIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, 63, avx.M256i))
-    uint8: opTwoGen(`<`, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), avx.M256i))
-    uint16: opTwoGen(`<`, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), avx.M256i))
-    uint32: opTwoGen(`<`, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), avx.M256i))
-    uint64: opTwoGen(`<`, avx.M256i, cmpltSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    float32: opTwoGen(cmplt_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 1, avx.M256))
+    float64: opTwoGen(cmplt_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 1, avx.M256d))
+    int8: opTwoGen(cmplt_avx_i8, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi8, avx.M256i))
+    int16: opTwoGen(cmplt_avx_i16, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi16, avx.M256i))
+    int32: opTwoGen(cmplt_avx_i32, avx.M256i, cmpltIntAvx2Gen(mm256_cmpgt_epi32, avx.M256i))
+    int64: opTwoGen(cmplt_avx_i64, avx.M256i, cmpltIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, 63, avx.M256i))
+    uint8: opTwoGen(cmplt_avx_u8, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), avx.M256i))
+    uint16: opTwoGen(cmplt_avx_u16, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), avx.M256i))
+    uint32: opTwoGen(cmplt_avx_u32, avx.M256i, cmpltUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), avx.M256i))
+    uint64: opTwoGen(cmplt_avx_u64, avx.M256i, cmpltSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
   `>`:
-    float32: opTwoGen(`>`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 6, avx.M256))
-    float64: opTwoGen(`>`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 6, avx.M256d))
+    float32: opTwoGen(cmpgt_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 6, avx.M256))
+    float64: opTwoGen(cmpgt_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 6, avx.M256d))
     int8: mm256_cmpgt_epi8
     int16: mm256_cmpgt_epi16
     int32: mm256_cmpgt_epi32
-    int64: opTwoGen(`>`, avx.M256i, cmpgtIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, 63, avx.M256i))
-    uint8: opTwoGen(`>`, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), avx.M256i))
-    uint16: opTwoGen(`>`, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), avx.M256i))
-    uint32: opTwoGen(`>`, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), avx.M256i))
-    uint64: opTwoGen(`>`, avx.M256i, cmpgtSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    int64: opTwoGen(cmpgt_avx_i64, avx.M256i, cmpgtIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, 63, avx.M256i))
+    uint8: opTwoGen(cmpgt_avx_u8, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), avx.M256i))
+    uint16: opTwoGen(cmpgt_avx_u16, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), avx.M256i))
+    uint32: opTwoGen(cmpgt_avx_u32, avx.M256i, cmpgtUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), avx.M256i))
+    uint64: opTwoGen(cmpgt_avx_u64, avx.M256i, cmpgtSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
   `<=`:
-    float32: opTwoGen(`<=`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 2, avx.M256))
-    float64: opTwoGen(`<=`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 2, avx.M256d))
-    int8: opTwoGen(`<=`, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    int16: opTwoGen(`<=`, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    int32: opTwoGen(`<=`, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    int64: opTwoGen(`<=`, avx.M256i, cmpleSubIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
-    uint8: opTwoGen(`<=`, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), mm256_set1_epi8, avx.M256i))
-    uint16: opTwoGen(`<=`, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), mm256_set1_epi16, avx.M256i))
-    uint32: opTwoGen(`<=`, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), mm256_set1_epi32, avx.M256i))
-    uint64: opTwoGen(`<=`, avx.M256i, cmpleSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    float32: opTwoGen(cmple_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 2, avx.M256))
+    float64: opTwoGen(cmple_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 2, avx.M256d))
+    int8: opTwoGen(cmple_avx_i8, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    int16: opTwoGen(cmple_avx_i16, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    int32: opTwoGen(cmple_avx_i32, avx.M256i, cmpleIntX86Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    int64: opTwoGen(cmple_avx_i64, avx.M256i, cmpleSubIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    uint8: opTwoGen(cmple_avx_u8, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), mm256_set1_epi8, avx.M256i))
+    uint16: opTwoGen(cmple_avx_u16, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), mm256_set1_epi16, avx.M256i))
+    uint32: opTwoGen(cmple_avx_u32, avx.M256i, cmpleUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), mm256_set1_epi32, avx.M256i))
+    uint64: opTwoGen(cmple_avx_u64, avx.M256i, cmpleSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
   `>=`:
-    float32: opTwoGen(`>=`, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 5, avx.M256))
-    float64: opTwoGen(`>=`, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 5, avx.M256d))
-    int8: opTwoGen(`>=`, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
-    int16: opTwoGen(`>=`, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
-    int32: opTwoGen(`>=`, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
-    int64: opTwoGen(`>=`, avx.M256i, cmpgeSubIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
-    uint8: opTwoGen(`>=`, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), mm256_set1_epi8, avx.M256i))
-    uint16: opTwoGen(`>=`, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), mm256_set1_epi16, avx.M256i))
-    uint32: opTwoGen(`>=`, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), mm256_set1_epi32, avx.M256i))
-    uint64: opTwoGen(`>=`, avx.M256i, cmpgeSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    float32: opTwoGen(cmpge_avx_f32, avx.M256, cmpFloatAvxGen(mm256_cmp_ps, 5, avx.M256))
+    float64: opTwoGen(cmpge_avx_f64, avx.M256d, cmpFloatAvxGen(mm256_cmp_pd, 5, avx.M256d))
+    int8: opTwoGen(cmpge_avx_i8, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, avx.M256i))
+    int16: opTwoGen(cmpge_avx_i16, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, avx.M256i))
+    int32: opTwoGen(cmpge_avx_i32, avx.M256i, cmpgeIntX86Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, avx.M256i))
+    int64: opTwoGen(cmpge_avx_i64, avx.M256i, cmpgeSubIntX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+    uint8: opTwoGen(cmpge_avx_u8, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi8, mm256_xor_si256, mm256_set1_epi8, cast[int8](0x80'u8), mm256_set1_epi8, avx.M256i))
+    uint16: opTwoGen(cmpge_avx_u16, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi16, mm256_xor_si256, mm256_set1_epi16, cast[int16](0x8000'u16), mm256_set1_epi16, avx.M256i))
+    uint32: opTwoGen(cmpge_avx_u32, avx.M256i, cmpgeUintAvx2Gen(mm256_cmpgt_epi32, mm256_xor_si256, mm256_set1_epi32, cast[int32](0x80000000'u32), mm256_set1_epi32, avx.M256i))
+    uint64: opTwoGen(cmpge_avx_u64, avx.M256i, cmpgeSubUintX86Gen(mm256_sub_epi64, mm256_xor_si256, mm256_and_si256, mm256_or_si256, mm256_srli_epi64, mm256_set1_epi64x, 63, avx.M256i))
+
+simdLoadInput("avx"):
+  loadU:
+    float32: mm256_loadu_ps
+    float64: mm256_loadu_pd
+    int8: opLoadGen(loadU_avx_i8, ptr int8, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    int16: opLoadGen(loadU_avx_i16, ptr int16, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    int32: opLoadGen(loadU_avx_i32, ptr int32, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    int64: opLoadGen(loadU_avx_i64, ptr int64, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    uint8: opLoadGen(loadU_avx_u8, ptr uint8, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    uint16: opLoadGen(loadU_avx_u16, ptr uint16, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    uint32: opLoadGen(loadU_avx_u32, ptr uint32, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+    uint64: opLoadGen(loadU_avx_u64, ptr uint64, avx.M256i, iLoadX86Gen(mm256_loadu_si256, avx.M256i))
+  loadA:
+    float32: mm256_load_ps
+    float64: mm256_load_pd
+    int8: opLoadGen(loadA_avx_i8, ptr int8, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    int16: opLoadGen(loadA_avx_i16, ptr int16, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    int32: opLoadGen(loadA_avx_i32, ptr int32, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    int64: opLoadGen(loadA_avx_i64, ptr int64, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    uint8: opLoadGen(loadA_avx_u8, ptr uint8, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    uint16: opLoadGen(loadA_avx_u16, ptr uint16, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    uint32: opLoadGen(loadA_avx_u32, ptr uint32, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+    uint64: opLoadGen(loadA_avx_u64, ptr uint64, avx.M256i, iLoadX86Gen(mm256_load_si256, avx.M256i))
+  load1:
+    float32: mm256_broadcast_ss
+    float64: mm256_broadcast_sd
+    int8: opLoadGen(load1_avx_i8, ptr int8, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastb_epi8, mm_cvtsi32_si128))
+    int16: opLoadGen(load1_avx_i16, ptr int16, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastw_epi16, mm_cvtsi32_si128))
+    int32: opLoadGen(load1_avx_i32, ptr int32, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastd_epi32, mm_cvtsi32_si128))
+    int64: opLoadGen(load1_avx_i64, ptr int64, avx.M256i, iLoad1LoadX86Gen(mm256_broadcastq_epi64, mm_loadl_epi64))
+    uint8: opLoadGen(load1_avx_u8, ptr uint8, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastb_epi8, mm_cvtsi32_si128))
+    uint16: opLoadGen(load1_avx_u16, ptr uint16, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastw_epi16, mm_cvtsi32_si128))
+    uint32: opLoadGen(load1_avx_u32, ptr uint32, avx.M256i, iLoad1CVTX86Gen(mm256_broadcastd_epi32, mm_cvtsi32_si128))
+    uint64: opLoadGen(load1_avx_u64, ptr uint64, avx.M256i, iLoad1LoadX86Gen(mm256_broadcastq_epi64, mm_loadl_epi64))
 
 # x86: AVX-512
 simdInput("avx512"):
@@ -4484,38 +4921,38 @@ simdInput("avx512"):
     uint32: mm512_xor_si512
     uint64: mm512_xor_si512
   `nand`:
-    float32: opTwoGen(`nand`, avx512f.M512, nandX86Gen(mm512_set1_epi32, mm512_and_ps, mm512_xor_ps, avx512f.M512))
-    float64: opTwoGen(`nand`, avx512f.M512d, nandX86Gen(mm512_set1_epi32, mm512_and_pd, mm512_xor_pd, avx512f.M512d))
-    int8: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    int16: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    int32: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    int64: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    uint8: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    uint16: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    uint32: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
-    uint64: opTwoGen(`nand`, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    float32: opTwoGen(nand_avx512_f32, avx512f.M512, nandX86Gen(mm512_set1_epi32, mm512_and_ps, mm512_xor_ps, avx512f.M512))
+    float64: opTwoGen(nand_avx512_f64, avx512f.M512d, nandX86Gen(mm512_set1_epi32, mm512_and_pd, mm512_xor_pd, avx512f.M512d))
+    int8: opTwoGen(nand_avx512_i8, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    int16: opTwoGen(nand_avx512_i16, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    int32: opTwoGen(nand_avx512_i32, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    int64: opTwoGen(nand_avx512_i64, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    uint8: opTwoGen(nand_avx512_u8, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    uint16: opTwoGen(nand_avx512_u16, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    uint32: opTwoGen(nand_avx512_u32, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
+    uint64: opTwoGen(nand_avx512_u64, avx512f.M512i, nandX86Gen(mm512_set1_epi32, mm512_and_si512, mm512_xor_si512, avx512f.M512i))
   `nor`:
-    float32: opTwoGen(`nor`, avx512f.M512, norX86Gen(mm512_set_epi32, mm512_or_ps, mm512_xor_ps, avx512f.M512))
-    float64: opTwoGen(`nor`, avx512f.M512d, norX86Gen(mm512_set_epi32, mm512_or_ps, mm512_xor_ps, avx512f.M512d))
-    int8: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    int16: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    int32: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    int64: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    uint8: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    uint16: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    uint32: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
-    uint64: opTwoGen(`nor`, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    float32: opTwoGen(nor_avx512_f32, avx512f.M512, norX86Gen(mm512_set_epi32, mm512_or_ps, mm512_xor_ps, avx512f.M512))
+    float64: opTwoGen(nor_avx512_f64, avx512f.M512d, norX86Gen(mm512_set_epi32, mm512_or_pd, mm512_xor_pd, avx512f.M512d))
+    int8: opTwoGen(nor_avx512_i8, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int16: opTwoGen(nor_avx512_i16, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int32: opTwoGen(nor_avx512_i32, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int64: opTwoGen(nor_avx512_i64, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint8: opTwoGen(nor_avx512_u8, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint16: opTwoGen(nor_avx512_u16, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint32: opTwoGen(nor_avx512_u32, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint64: opTwoGen(nor_avx512_u64, avx512f.M512i, norX86Gen(mm512_set_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
   `nxor`:
-    float32: opTwoGen(`nxor`, avx512f.M512, nxorX86Gen(mm512_set1_epi32, mm512_xor_ps, avx512f.M512))
-    float64: opTwoGen(`nxor`, avx512f.M512d, nxorX86Gen(mm512_set1_epi32, mm512_xor_pd, avx512f.M512d))
-    int8: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    int16: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    int32: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    int64: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    uint8: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    uint16: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    uint32: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
-    uint64: opTwoGen(`nxor`, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    float32: opTwoGen(nxor_avx512_f32, avx512f.M512, nxorX86Gen(mm512_set1_epi32, mm512_xor_ps, avx512f.M512))
+    float64: opTwoGen(nxor_avx512_f64, avx512f.M512d, nxorX86Gen(mm512_set1_epi32, mm512_xor_pd, avx512f.M512d))
+    int8: opTwoGen(nxor_avx512_i8, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    int16: opTwoGen(nxor_avx512_i16, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    int32: opTwoGen(nxor_avx512_i32, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    int64: opTwoGen(nxor_avx512_i64, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    uint8: opTwoGen(nxor_avx512_u8, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    uint16: opTwoGen(nxor_avx512_u16, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    uint32: opTwoGen(nxor_avx512_u32, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
+    uint64: opTwoGen(nxor_avx512_u64, avx512f.M512i, nxorX86Gen(mm512_set1_epi32, mm512_xor_si512, avx512f.M512i))
   `andnot`:
     float32: mm512_andnot_ps
     float64: mm512_andnot_pd
@@ -4528,62 +4965,95 @@ simdInput("avx512"):
     uint32: mm512_andnot_si512
     uint64: mm512_andnot_si512
   `ornot`:
-    float32: opTwoGen(`ornot`, avx512.M512, ornotX86Gen(mm512_set1_epi32, mm512_or_ps, mm512_xor_ps, avx512.M512))
-    float64: opTwoGen(`ornot`, avx512.M512d, ornotX86Gen(mm512_set1_epi32, mm512_or_pd, mm512_xor_pd, avx512.M512d))
-    int8: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    int16: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    int32: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    int64: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    uint8: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    uint16: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    uint32: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
-    uint64: opTwoGen(`ornot`, avx512.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512.M512i))
+    float32: opTwoGen(ornot_avx512_f32, avx512f.M512, ornotX86Gen(mm512_set1_epi32, mm512_or_ps, mm512_xor_ps, avx512f.M512))
+    float64: opTwoGen(ornot_avx512_f64, avx512f.M512d, ornotX86Gen(mm512_set1_epi32, mm512_or_pd, mm512_xor_pd, avx512f.M512d))
+    int8: opTwoGen(ornot_avx512_i8, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int16: opTwoGen(ornot_avx512_i16, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int32: opTwoGen(ornot_avx512_i32, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    int64: opTwoGen(ornot_avx512_i64, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint8: opTwoGen(ornot_avx512_u8, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint16: opTwoGen(ornot_avx512_u16, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint32: opTwoGen(ornot_avx512_u32, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
+    uint64: opTwoGen(ornot_avx512_u64, avx512f.M512i, ornotX86Gen(mm512_set1_epi32, mm512_or_si512, mm512_xor_si512, avx512f.M512i))
   `shl`:
-    float32: typeGen(`shl_avx512_f32`, mm512_sll_epi32, avx512f.M512, avx512f.M512i)
-    float64: typeGen(`shl_avx512_f64`, mm512_sll_epi64, avx512f.M512d, avx512f.M512i)
-    int8: opTwoGen(`shl`, avx512f.M512i, shlX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sll_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
+    float32: typeGen(shl_avx512_f32, mm512_sll_epi32, avx512f.M512, avx512f.M512i)
+    float64: typeGen(shl_avx512_f64, mm512_sll_epi64, avx512f.M512d, avx512f.M512i)
+    int8: opTwoGen(shl_avx512_i8, avx512f.M512i, shlX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sll_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
     int16: mm512_sll_epi16
     int32: mm512_sll_epi32
     int64: mm512_sll_epi64
-    uint8: opTwoGen(`shl`, avx512f.M512i, shlX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sll_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
+    uint8: opTwoGen(shl_avx512_u8, avx512f.M512i, shlX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sll_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
     uint16: mm512_sll_epi16
     uint32: mm512_sll_epi32
     uint64: mm512_sll_epi64
   `shr`:
-    float32: typeGen(`shr_avx512_f32`, mm512_srl_epi32, avx512f.M512, avx512f.M512i)
-    float64: typeGen(`shr_avx512_f64`, mm512_srl_epi64, avx512f.M512d, avx512f.M512i)
-    int8: opTwoGen(`shr`, avx512f.M512i, shrX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sra_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
-    uint8: opTwoGen(`shr`, avx512f.M512i, shrX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_srl_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
+    float32: typeGen(shr_avx512_f32, mm512_srl_epi32, avx512f.M512, avx512f.M512i)
+    float64: typeGen(shr_avx512_f64, mm512_srl_epi64, avx512f.M512d, avx512f.M512i)
+    int8: opTwoGen(shr_avx512_i8, avx512f.M512i, shrX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_sra_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
+    uint8: opTwoGen(shr_avx512_u8, avx512f.M512i, shrX86Gen(mm512_unpacklo_epi8, mm512_unpackhi_epi8, mm512_srl_epi16, mm512_and_si512, mm512_set1_epi16, mm512_packus_epi16, avx512f.M512i))
     int16: mm512_sra_epi16
     uint16: mm512_srl_epi16
     int32: mm512_sra_epi32
     uint32: mm512_srl_epi32
     int64: mm512_sra_epi64
     uint64: mm512_srl_epi64
+  `min`:
+    float32: mm512_min_ps
+    float64: mm512_min_pd
+    int8: mm512_min_epi8
+    int16: mm512_min_epi16
+    int32: mm512_min_epi32
+    int64: mm512_min_epi64
+    uint8: mm512_min_epu8
+    uint16: mm512_min_epu16
+    uint32: mm512_min_epu32
+    uint64: mm512_min_epu64
+  `max`:
+    float32: mm512_max_ps
+    float64: mm512_max_pd
+    int8: mm512_max_epi8
+    int16: mm512_max_epi16
+    int32: mm512_max_epi32
+    int64: mm512_max_epi64
+    uint8: mm512_max_epu8
+    uint16: mm512_max_epu16
+    uint32: mm512_max_epu32
+    uint64: mm512_max_epu64
 
 simdUnaryInput("avx512"):
   `not`:
-    float32: opOneGen(`not`, avx512f.M512, notX86Gen(mm512_xor_ps, mm512_set1_epi32, M512))
-    float64: opOneGen(`not`, avx512f.M512d, notX86Gen(mm512_xor_pd, mm512_set1_epi32, M512d))
-    int8: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi8, M512i))
-    int16: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi16, M512i))
-    int32: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi32, M512i))
-    int64: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi64, M512i))
-    uint8: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi8, M512i))
-    uint16: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi16, M512i))
-    uint32: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi32, M512i))
-    uint64: opOneGen(`not`, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi64, M512i))
+    float32: opOneGen(not_avx512_f32, avx512f.M512, notX86Gen(mm512_xor_ps, mm512_set1_epi32, avx512f.M512))
+    float64: opOneGen(not_avx512_f64, avx512f.M512d, notX86Gen(mm512_xor_pd, mm512_set1_epi32, avx512f.M512d))
+    int8: opOneGen(not_avx512_i8, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi8, avx512f.M512i))
+    int16: opOneGen(not_avx512_i16, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi16, avx512f.M512i))
+    int32: opOneGen(not_avx512_i32, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi32, avx512f.M512i))
+    int64: opOneGen(not_avx512_i64, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi64, avx512f.M512i))
+    uint8: opOneGen(not_avx512_u8, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi8, avx512f.M512i))
+    uint16: opOneGen(not_avx512_u16, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi16, avx512f.M512i))
+    uint32: opOneGen(not_avx512_u32, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi32, avx512f.M512i))
+    uint64: opOneGen(not_avx512_u64, avx512f.M512i, notX86Gen(mm512_xor_si512, mm512_set1_epi64, avx512f.M512i))
   `abs`:
-    float32: opOneGen(`abs`, avx512f.M512, absFloatX86Gen(mm512_set1_ps, (-0.0'f32), mm512_andnot_ps, avx512f.M512))
-    float64: opOneGen(`abs`, avx512f.M512d, absFloatX86Gen(mm512_set1_pd, (-0.0'f64), mm512_andnot_pd, avx512f.M512d))
+    float32: opOneGen(abs_avx512_f32, avx512f.M512, absFloatX86Gen(mm512_set1_ps, (-0.0'f32), mm512_andnot_ps, avx512f.M512))
+    float64: opOneGen(abs_avx512_f64, avx512f.M512d, absFloatX86Gen(mm512_set1_pd, (-0.0'f64), mm512_andnot_pd, avx512f.M512d))
     int8: mm512_abs_epi8
     int16: mm512_abs_epi16
     int32: mm512_abs_epi32
     int64: mm512_abs_epi64
-    uint8: opOneGen(`abs`, avx512f.M512i, absUintX86Gen())
-    uint16: opOneGen(`abs`, avx512f.M512i, absUintX86Gen())
-    uint32: opOneGen(`abs`, avx512f.M512i, absUintX86Gen())
-    uint64: opOneGen(`abs`, avx512f.M512i, absUintX86Gen())
+    uint8: opOneGen(abs_avx512_u8, avx512f.M512i, absUintX86Gen())
+    uint16: opOneGen(abs_avx512_u16, avx512f.M512i, absUintX86Gen())
+    uint32: opOneGen(abs_avx512_u32, avx512f.M512i, absUintX86Gen())
+    uint64: opOneGen(abs_avx512_u64, avx512f.M512i, absUintX86Gen())
+  `sqrt`:
+    float32: mm512_sqrt_ps
+    float64: mm512_sqrt_pd
+    int8: none
+    int16: none
+    int32: none
+    int64: none
+    uint8: none
+    uint16: none
+    uint32: none
+    uint64: none
 
 macro cmpltInt512Gen(vpcmp_inst, vmovdqu_inst, T: untyped): untyped =
   result = quote do:
@@ -4654,71 +5124,106 @@ macro cmpFloat512Gen(vcmpp_inst, vmovdqu_int_inst, cast_inst, imm8: static int, 
 
 simdMaskInput("avx512"):
   `==`:
-    float32: opTwoGen(`==`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 0, avx512f.M512))
-    float64: opTwoGen(`==`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 0, avx512f.M512d))
-    int8: opTwoGen(`==`, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`==`, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`==`, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`==`, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`==`, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`==`, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`==`, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`==`, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmpeq_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 0, avx512f.M512))
+    float64: opTwoGen(cmpeq_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 0, avx512f.M512d))
+    int8: opTwoGen(cmpeq_avx512_i8, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmpeq_avx512_i16, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmpeq_avx512_i32, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmpeq_avx512_i64, avx512f.M512i, cmpeqInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmpeq_avx512_u8, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmpeq_avx512_u16, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmpeq_avx512_u32, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmpeq_avx512_u64, avx512f.M512i, cmpeqUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
   `!=`:
-    float32: opTwoGen(`!=`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 12, avx512f.M512))
-    float64: opTwoGen(`!=`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 12, avx512f.M512d))
-    int8: opTwoGen(`!=`, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`!=`, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`!=`, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`!=`, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`!=`, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`!=`, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`!=`, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`!=`, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmpneq_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 12, avx512f.M512))
+    float64: opTwoGen(cmpneq_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 12, avx512f.M512d))
+    int8: opTwoGen(cmpneq_avx512_i8, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmpneq_avx512_i16, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmpneq_avx512_i32, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmpneq_avx512_i64, avx512f.M512i, cmpneqInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmpneq_avx512_u8, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmpneq_avx512_u16, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmpneq_avx512_u32, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmpneq_avx512_u64, avx512f.M512i, cmpneqUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
   `<`:
-    float32: opTwoGen(`<`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 1, avx512f.M512))
-    float64: opTwoGen(`<`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 1, avx512f.M512d))
-    int8: opTwoGen(`<`, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`<`, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`<`, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`<`, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`<`, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`<`, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`<`, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`<`, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmplt_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 1, avx512f.M512))
+    float64: opTwoGen(cmplt_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 1, avx512f.M512d))
+    int8: opTwoGen(cmplt_avx512_i8, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmplt_avx512_i16, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmplt_avx512_i32, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmplt_avx512_i64, avx512f.M512i, cmpltInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmplt_avx512_u8, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmplt_avx512_u16, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmplt_avx512_u32, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmplt_avx512_u64, avx512f.M512i, cmpltUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
   `>`:
-    float32: opTwoGen(`>`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 6, avx512f.M512))
-    float64: opTwoGen(`>`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 6, avx512f.M512d))
-    int8: opTwoGen(`>`, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`>`, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`>`, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`>`, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`>`, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`>`, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`>`, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`>`, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmpgt_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 6, avx512f.M512))
+    float64: opTwoGen(cmpgt_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 6, avx512f.M512d))
+    int8: opTwoGen(cmpgt_avx512_i8, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmpgt_avx512_i16, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmpgt_avx512_i32, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmpgt_avx512_i64, avx512f.M512i, cmpgtInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmpgt_avx512_u8, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmpgt_avx512_u16, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmpgt_avx512_u32, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmpgt_avx512_u64, avx512f.M512i, cmpgtUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
   `>=`:
-    float32: opTwoGen(`>=`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 5, avx512f.M512))
-    float64: opTwoGen(`>=`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 5, avx512f.M512d))
-    int8: opTwoGen(`>=`, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`>=`, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`>=`, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`>=`, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`>=`, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`>=`, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`>=`, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`>=`, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmpge_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 5, avx512f.M512))
+    float64: opTwoGen(cmpge_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 5, avx512f.M512d))
+    int8: opTwoGen(cmpge_avx512_i8, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmpge_avx512_i16, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmpge_avx512_i32, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmpge_avx512_i64, avx512f.M512i, cmpgeInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmpge_avx512_u8, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmpge_avx512_u16, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmpge_avx512_u32, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmpge_avx512_u64, avx512f.M512i, cmpgeUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
   `<=`:
-    float32: opTwoGen(`<=`, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 2, avx512f.M512))
-    float64: opTwoGen(`<=`, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 2, avx512f.M512d))
-    int8: opTwoGen(`<=`, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
-    int16: opTwoGen(`<=`, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
-    int32: opTwoGen(`<=`, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
-    int64: opTwoGen(`<=`, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
-    uint8: opTwoGen(`<=`, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
-    uint16: opTwoGen(`<=`, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
-    uint32: opTwoGen(`<=`, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
-    uint64: opTwoGen(`<=`, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+    float32: opTwoGen(cmple_avx512_f32, avx512f.M512, cmpFloat512Gen(mm512_cmp_ps_mask, mm512_movm_epi32, mm512_castsi512_ps, 2, avx512f.M512))
+    float64: opTwoGen(cmple_avx512_f64, avx512f.M512d, cmpFloat512Gen(mm512_cmp_pd_mask, mm512_movm_epi64, mm512_castsi512_pd, 2, avx512f.M512d))
+    int8: opTwoGen(cmple_avx512_i8, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi8_mask, mm512_movm_epi8, avx512f.M512i))
+    int16: opTwoGen(cmple_avx512_i16, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi16_mask, mm512_movm_epi16, avx512f.M512i))
+    int32: opTwoGen(cmple_avx512_i32, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi32_mask, mm512_movm_epi32, avx512f.M512i))
+    int64: opTwoGen(cmple_avx512_i64, avx512f.M512i, cmpleInt512Gen(mm512_cmp_epi64_mask, mm512_movm_epi64, avx512f.M512i))
+    uint8: opTwoGen(cmple_avx512_u8, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu8_mask, mm512_movm_epi8, avx512f.M512i))
+    uint16: opTwoGen(cmple_avx512_u16, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu16_mask, mm512_movm_epi16, avx512f.M512i))
+    uint32: opTwoGen(cmple_avx512_u32, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu32_mask, mm512_movm_epi32, avx512f.M512i))
+    uint64: opTwoGen(cmple_avx512_u64, avx512f.M512i, cmpleUint512Gen(mm512_cmp_epu64_mask, mm512_movm_epi64, avx512f.M512i))
+
+simdLoadInput("avx512"):
+  loadU:
+    float32: mm512_loadu_ps
+    float64: mm512_loadu_pd
+    int8: opLoadGen(loadU_avx512_i8, ptr int8, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    int16: opLoadGen(loadU_avx512_i16, ptr int16, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    int32: opLoadGen(loadU_avx512_i32, ptr int32, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    int64: opLoadGen(loadU_avx512_i64, ptr int64, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    uint8: opLoadGen(loadU_avx512_u8, ptr uint8, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    uint16: opLoadGen(loadU_avx512_u16, ptr uint16, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    uint32: opLoadGen(loadU_avx512_u32, ptr uint32, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+    uint64: opLoadGen(loadU_avx512_u64, ptr uint64, avx512f.M512i, iLoadX86Gen(mm512_loadu_si512, avx512f.M512i))
+  loadA:
+    float32: mm512_load_ps
+    float64: mm512_load_pd
+    int8: opLoadGen(loadA_avx512_i8, ptr int8, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    int16: opLoadGen(loadA_avx512_i16, ptr int16, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    int32: opLoadGen(loadA_avx512_i32, ptr int32, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    int64: opLoadGen(loadA_avx512_i64, ptr int64, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    uint8: opLoadGen(loadA_avx512_u8, ptr uint8, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    uint16: opLoadGen(loadA_avx512_u16, ptr uint16, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    uint32: opLoadGen(loadA_avx512_u32, ptr uint32, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+    uint64: opLoadGen(loadA_avx512_u64, ptr uint64, avx512f.M512i, iLoadX86Gen(mm512_load_si512, avx512f.M512i))
+  load1:
+    float32: opLoadGen(load1_avx512_f32, ptr float32, avx512f.M512, fLoad1LoadX86Gen(mm512_broadcastss_ps, mm_load_ss))
+    float64: opLoadGen(load1_avx512_f64, ptr float64, avx512f.M512d, fLoad1LoadX86Gen(mm512_broadcastsd_pd, mm_load_sd))
+    int8: opLoadGen(load1_avx512_i8, ptr int8, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastb_epi8, mm_loadu_si128))
+    int16: opLoadGen(load1_avx512_i16, ptr int16, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastw_epi16, mm_loadu_si128))
+    int32: opLoadGen(load1_avx512_i32, ptr int32, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastd_epi32, mm_loadu_si128))
+    int64: opLoadGen(load1_avx512_i64, ptr int64, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastq_epi64, mm_loadu_si128))
+    uint8: opLoadGen(load1_avx512_u8, ptr uint8, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastb_epi8, mm_loadu_si128))
+    uint16: opLoadGen(load1_avx512_u16, ptr uint16, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastw_epi16, mm_loadu_si128))
+    uint32: opLoadGen(load1_avx512_u32, ptr uint32, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastd_epi32, mm_loadu_si128))
+    uint64: opLoadGen(load1_avx512_u64, ptr uint64, avx512f.M512i, iLoad1LoadX86Gen(mm512_broadcastq_epi64, mm_loadu_si128))
 #[
 # x86: AVX-512 128-bit mask
 simdInput("mask128"):
@@ -4915,8 +5420,8 @@ simdInput("neon"):
     uint32: vmulq_u32
     uint64: none
   `and`:
-    float32: typeGen(and_neon_f32, vandq_u32, Float32x4, Uint32x4)
-    float64: typeGen(and_neon_f64, vandq_u64, Float64x2, Uint64x2)
+    float32: typeGen(and_neon_f32, vandq_u32, neon.Float32x4, neon.Uint32x4)
+    float64: typeGen(and_neon_f64, vandq_u64, neon.Float64x2, neon.Uint64x2)
     int8: vandq_s8
     int16: vandq_s16
     int32: vandq_s32
@@ -4926,8 +5431,8 @@ simdInput("neon"):
     uint32: vandq_u32
     uint64: vandq_u64
   `or`:
-    float32: typeGen(or_neon_f32, vorrq_u32, Float32x4, Uint32x4)
-    float64: typeGen(or_neon_f64, vorrq_u32, Float32x4, Uint32x4)
+    float32: typeGen(or_neon_f32, vorrq_u32, neon.Float32x4, neon.Uint32x4)
+    float64: typeGen(or_neon_f64, vorrq_u32, neon.Float32x4, neon.Uint32x4)
     int8: vorrq_s8
     int16: vorrq_s16
     int32: vorrq_s32
@@ -4937,8 +5442,8 @@ simdInput("neon"):
     uint32: vorrq_u32
     uint64: vorrq_u64
   `xor`:
-    float32: typeGen(xor_neon_f32, veorq_u32, Float32x4, Uint32x4)
-    float64: typeGen(xor_neon_f64, veorq_u64, Float64x2, Uint64x4)
+    float32: typeGen(xor_neon_f32, veorq_u32, neon.Float32x4, neon.Uint32x4)
+    float64: typeGen(xor_neon_f64, veorq_u64, neon.Float64x2, neon.Uint64x2)
     int8: veorq_s8
     int16: veorq_s16
     int32: veorq_s32
@@ -4948,82 +5453,104 @@ simdInput("neon"):
     uint32: veorq_u32
     uint64: veorq_u64
   `nand`:
-    float32: opTwoGen(`nand`, neon.Float32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    float64: opTwoGen(`nand`, neon.Float64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    int8: opTwoGen(`nand`, neon.Int8x16, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    int16: opTwoGen(`nand`, neon.Int16x8, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    int32: opTwoGen(`nand`, neon.Int32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    int64: opTwoGen(`nand`, neon.Int64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    uint8: opTwoGen(`nand`, neon.Uint8x16, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    uint16: opTwoGen(`nand`, neon.Uint16x8, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    uint32: opTwoGen(`nand`, neon.Uint32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    uint64: opTwoGen(`nand`, neon.Uint64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    float32: opTwoGen(nand_neon_f32, neon.Float32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    float64: opTwoGen(nand_neon_f64, neon.Float64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    int8: opTwoGen(nand_neon_i8, neon.Int8x16, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    int16: opTwoGen(nand_neon_i16, neon.Int16x8, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    int32: opTwoGen(nand_neon_i32, neon.Int32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    int64: opTwoGen(nand_neon_i64, neon.Int64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    uint8: opTwoGen(nand_neon_u8, neon.Uint8x16, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    uint16: opTwoGen(nand_neon_u16, neon.Uint16x8, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    uint32: opTwoGen(nand_neon_u32, neon.Uint32x4, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    uint64: opTwoGen(nand_neon_u64, neon.Uint64x2, nandArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
   `nor`:
-    float32: opTwoGen(`nor`, neon.Float32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    float64: opTwoGen(`nor`, neon.Float64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    int8: opTwoGen(`nor`, neon.Int8x16, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    int16: opTwoGen(`nor`, neon.Int16x8, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    int32: opTwoGen(`nor`, neon.Int32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    int64: opTwoGen(`nor`, neon.Int64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    uint8: opTwoGen(`nor`, neon.Uint8x16, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    uint16: opTwoGen(`nor`, neon.Uint16x8, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    uint32: opTwoGen(`nor`, neon.Uint32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    uint64: opTwoGen(`nor`, neon.Uint64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    float32: opTwoGen(nor_neon_f32, neon.Float32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    float64: opTwoGen(nor_neon_f64, neon.Float64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    int8: opTwoGen(nor_neon_i8, neon.Int8x16, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    int16: opTwoGen(nor_neon_i16, neon.Int16x8, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    int32: opTwoGen(nor_neon_i32, neon.Int32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    int64: opTwoGen(nor_neon_i64, neon.Int64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    uint8: opTwoGen(nor_neon_u8, neon.Uint8x16, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    uint16: opTwoGen(nor_neon_u16, neon.Uint16x8, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    uint32: opTwoGen(nor_neon_u32, neon.Uint32x4, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    uint64: opTwoGen(nor_neon_u64, neon.Uint64x2, norArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
   `nxor`:
-    float32: opTwoGen(`nxor`, neon.Float32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    float64: opTwoGen(`nxor`, neon.Float64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    int8: opTwoGen(`nxor`, neon.Int8x16, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    int16: opTwoGen(`nxor`, neon.Int16x8, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    int32: opTwoGen(`nxor`, neon.Int32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    int64: opTwoGen(`nxor`, neon.Int64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    uint8: opTwoGen(`nxor`, neon.Uint8x16, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    uint16: opTwoGen(`nxor`, neon.Uint16x8, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    uint32: opTwoGen(`nxor`, neon.Uint32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
-    uint64: opTwoGen(`nxor`, neon.Uint64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    float32: opTwoGen(nxor_neon_f32, neon.Float32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    float64: opTwoGen(nxor_neon_f64, neon.Float64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    int8: opTwoGen(nxor_neon_i8, neon.Int8x16, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    int16: opTwoGen(nxor_neon_i16, neon.Int16x8, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    int32: opTwoGen(nxor_neon_i32, neon.Int32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    int64: opTwoGen(nxor_neon_i64, neon.Int64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    uint8: opTwoGen(nxor_neon_u8, neon.Uint8x16, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    uint16: opTwoGen(nxor_neon_u16, neon.Uint16x8, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    uint32: opTwoGen(nxor_neon_u32, neon.Uint32x4, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
+    uint64: opTwoGen(nxor_neon_u64, neon.Uint64x2, norArmGen(veorq_u32, vmvnq_u32, neon.Uint32x4))
   `andnot`:
-    float32: opTwoGen(`andnot`, neon.Float32x4, andnotArmGen(vandq_f32, vmvnq_f32, neon.Float32x4))
-    float64: opTwoGen(`andnot`, neon.Float64x2, andnotArmGen(vandq_f64, vmvnq_f64, neon.Float64x2))
-    int8: opTwoGen(`andnot`, neon.Int8x16, andnotArmGen(vandq_s8, vmvnq_s8, neon.Int8x16))
-    int16: opTwoGen(`andnot`, neon.Int16x8, andnotArmGen(vandq_s16, vmvnq_s16, neon.Int16x8))
-    int32: opTwoGen(`andnot`, neon.Int32x4, andnotArmGen(vandq_s32, vmvnq_s32, neon.Int32x4))
-    int64: opTwoGen(`andnot`, neon.Int64x2, andnotArmGen(vandq_s64, vmvnq_s64, neon.Int64x2))
-    uint8: opTwoGen(`andnot`, neon.Uint8x16, andnotArmGen(vandq_u8, vmvnq_u8, neon.Uint8x16))
-    uint16: opTwoGen(`andnot`, neon.Uint16x8, andnotArmGen(vandq_u16, vmvnq_u16, neon.Uint16x8))
-    uint32: opTwoGen(`andnot`, neon.Uint32x4, andnotArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
-    uint64: opTwoGen(`andnot`, neon.Uint64x2, andnotArmGen(vandq_u64, vmvnq_u64, neon.Uint64x2))
+    float32: opTwoGen(andnot_neon_f32, neon.Float32x4, andnotArmGen(vandq_f32, vmvnq_f32, neon.Float32x4))
+    float64: opTwoGen(andnot_neon_f64, neon.Float64x2, andnotArmGen(vandq_f64, vmvnq_f64, neon.Float64x2))
+    int8: opTwoGen(andnot_neon_i8, neon.Int8x16, andnotArmGen(vandq_s8, vmvnq_s8, neon.Int8x16))
+    int16: opTwoGen(andnot_neon_i16, neon.Int16x8, andnotArmGen(vandq_s16, vmvnq_s16, neon.Int16x8))
+    int32: opTwoGen(andnot_neon_i32, neon.Int32x4, andnotArmGen(vandq_s32, vmvnq_s32, neon.Int32x4))
+    int64: opTwoGen(andnot_neon_i64, neon.Int64x2, andnotArmGen(vandq_s64, vmvnq_s64, neon.Int64x2))
+    uint8: opTwoGen(andnot_neon_u8, neon.Uint8x16, andnotArmGen(vandq_u8, vmvnq_u8, neon.Uint8x16))
+    uint16: opTwoGen(andnot_neon_u16, neon.Uint16x8, andnotArmGen(vandq_u16, vmvnq_u16, neon.Uint16x8))
+    uint32: opTwoGen(andnot_neon_u32, neon.Uint32x4, andnotArmGen(vandq_u32, vmvnq_u32, neon.Uint32x4))
+    uint64: opTwoGen(andnot_neon_u64, neon.Uint64x2, andnotArmGen(vandq_u64, vmvnq_u64, neon.Uint64x2))
   `ornot`:
-    float32: opTwoGen(`ornot`, neon.Float32x4, ornotArmGen(vorrq_f32, vmvnq_f32, neon.Float32x4))
-    float64: opTwoGen(`ornot`, neon.Float64x2, ornotArmGen(vorrq_f64, vmvnq_f64, neon.Float64x2))
-    int8: opTwoGen(`ornot`, neon.Int8x16, ornotArmGen(vorrq_s8, vmvnq_s8, neon.Int8x16))
-    int16: opTwoGen(`ornot`, neon.Int16x8, ornotArmGen(vorrq_s16, vmvnq_s16, neon.Int16x8))
-    int32: opTwoGen(`ornot`, neon.Int32x4, ornotArmGen(vorrq_s32, vmvnq_s32, neon.Int32x4))
-    int64: opTwoGen(`ornot`, neon.Int64x2, ornotArmGen(vorrq_s64, vmvnq_s64, neon.Int64x2))
-    uint8: opTwoGen(`ornot`, neon.Uint8x16, ornotArmGen(vorrq_u8, vmvnq_u8, neon.Uint8x16))
-    uint16: opTwoGen(`ornot`, neon.Uint16x8, ornotArmGen(vorrq_u16, vmvnq_u16, neon.Uint16x8))
-    uint32: opTwoGen(`ornot`, neon.Uint32x4, ornotArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
-    uint64: opTwoGen(`ornot`, neon.Uint64x2, ornotArmGen(vorrq_u64, vmvnq_u64, neon.Uint64x2))
+    float32: opTwoGen(ornot_neon_f32, neon.Float32x4, ornotArmGen(vorrq_f32, vmvnq_f32, neon.Float32x4))
+    float64: opTwoGen(ornot_neon_f64, neon.Float64x2, ornotArmGen(vorrq_f64, vmvnq_f64, neon.Float64x2))
+    int8: opTwoGen(ornot_neon_i8, neon.Int8x16, ornotArmGen(vorrq_s8, vmvnq_s8, neon.Int8x16))
+    int16: opTwoGen(ornot_neon_i16, neon.Int16x8, ornotArmGen(vorrq_s16, vmvnq_s16, neon.Int16x8))
+    int32: opTwoGen(ornot_neon_i32, neon.Int32x4, ornotArmGen(vorrq_s32, vmvnq_s32, neon.Int32x4))
+    int64: opTwoGen(ornot_neon_i64, neon.Int64x2, ornotArmGen(vorrq_s64, vmvnq_s64, neon.Int64x2))
+    uint8: opTwoGen(ornot_neon_u8, neon.Uint8x16, ornotArmGen(vorrq_u8, vmvnq_u8, neon.Uint8x16))
+    uint16: opTwoGen(ornot_neon_u16, neon.Uint16x8, ornotArmGen(vorrq_u16, vmvnq_u16, neon.Uint16x8))
+    uint32: opTwoGen(ornot_neon_u32, neon.Uint32x4, ornotArmGen(vorrq_u32, vmvnq_u32, neon.Uint32x4))
+    uint64: opTwoGen(ornot_neon_u64, neon.Uint64x2, ornotArmGen(vorrq_u64, vmvnq_u64, neon.Uint64x2))
   `shl`:
-    float32: opTwoDiffGen(`shl`, neon.Float32x4, neon.Int32x4, neon.Float32x4, shlArmGen(vshlq_u8, neon.Uint32x4))
-    float64: opTwoDiffGen(`shl`, neon.Float64x2, neon.Int64x2, neon.Float64x2, shlArmGen(vshlq_u8, neon.Uint64x2))
+    float32: opTwoDiffGen(shl_neon_f32, neon.Float32x4, neon.Int32x4, neon.Float32x4, shlArmGen(vshlq_u8, neon.Uint32x4))
+    float64: opTwoDiffGen(shl_neon_f64, neon.Float64x2, neon.Int64x2, neon.Float64x2, shlArmGen(vshlq_u8, neon.Uint64x2))
     int8: vshlq_s8
     int16: vshlq_s16
     int32: vshlq_s32
     int64: vshlq_s64
-    uint8: opTwoDiffGen(`shl`, neon.Uint8x16, neon.Int8x16, neon.Uint8x16, shlArmGen(vshlq_u8, neon.Uint8x16))
-    uint16: opTwoDiffGen(`shl`, neon.Uint16x8, neon.Int16x8, neon.Uint16x8, shlArmGen(vshlq_u8, neon.Uint16x8))
-    uint32: opTwoDiffGen(`shl`, neon.Uint32x4, neon.Int32x4, neon.Uint32x4, shlArmGen(vshlq_u8, neon.Uint32x4))
-    uint64: opTwoDiffGen(`shl`, neon.Uint64x2, neon.Int64x2, neon.Uint64x2, shlArmGen(vshlq_u8, neon.Uint64x2))
+    uint8: opTwoDiffGen(shl_neon_u8, neon.Uint8x16, neon.Int8x16, neon.Uint8x16, shlArmGen(vshlq_u8, neon.Uint8x16))
+    uint16: opTwoDiffGen(shl_neon_u16, neon.Uint16x8, neon.Int16x8, neon.Uint16x8, shlArmGen(vshlq_u8, neon.Uint16x8))
+    uint32: opTwoDiffGen(shl_neon_u32, neon.Uint32x4, neon.Int32x4, neon.Uint32x4, shlArmGen(vshlq_u8, neon.Uint32x4))
+    uint64: opTwoDiffGen(shl_neon_u64, neon.Uint64x2, neon.Int64x2, neon.Uint64x2, shlArmGen(vshlq_u8, neon.Uint64x2))
   `shr`:
-    float32: opTwoDiffGen(`shr`, neon.Float32x4, neon.Int32x4, neon.Float32x4, shrArmGen(vshlq_u32, vnegq_s32, neon.Uint32x4))
-    float64: opTwoDiffGen(`shr`, neon.Float64x2, neon.Int64x2, neon.FLoat64x2, shrArmGen(vshlq_u64, vnegq_s64, neon.uint64x2))
-    int8: opTwoGen(`shr`, neon.Int8x16, shrArmGen(vshlq_s8, vnegq_s8, neon.Int8x16))
-    int16: opTwoGen(`shr`, neon.Int16x8, shrArmGen(vshlq_s16, vnegq_s16, neon.Int16x8))
-    int32: opTwoGen(`shr`, neon.Int32x4, shrArmGen(vshlq_s32, vnegq_s32, neon.Int32x4))
-    int64: opTwoGen(`shr`, neon.Int64x2, shrArmGen(vshlq_s64, vnegq_s64, neon.Int64x2))
-    uint8: opTwoDiffGen(`shr`, neon.Uint8x16, neon.Int8x16, neon.Uint8x16, shrArmGen(vshlq_u8, vnegq_s8, neon.Uint8x16))
-    uint16: opTwoDiffGen(`shr`, neon.Uint16x8, neon.Int16x8, neon.Uint16x8, shrArmGen(vshlq_u16, vnegq_s16, neon.Uint16x8))
-    uint32: opTwoDiffGen(`shr`, neon.Uint32x4, neon.Int32x4, neon.Uint32x4, shrArmGen(vshlq_u32, vnegq_s32, neon.Uint32x4))
-    uint64: opTwoDiffGen(`shr`, neon.Uint64x2, neon.Int64x2, neon.Uint64x2, shrArmGen(vshlq_u64, vnegq_s64, neon.Uint64x2))
+    float32: opTwoDiffGen(shr_neon_f32, neon.Float32x4, neon.Int32x4, neon.Float32x4, shrArmGen(vshlq_u32, vnegq_s32, neon.Uint32x4))
+    float64: opTwoDiffGen(shr_neon_f64, neon.Float64x2, neon.Int64x2, neon.Float64x2, shrArmGen(vshlq_u64, vnegq_s64, neon.Uint64x2))
+    int8: opTwoGen(shr_neon_i8, neon.Int8x16, shrArmGen(vshlq_s8, vnegq_s8, neon.Int8x16))
+    int16: opTwoGen(shr_neon_i16, neon.Int16x8, shrArmGen(vshlq_s16, vnegq_s16, neon.Int16x8))
+    int32: opTwoGen(shr_neon_i32, neon.Int32x4, shrArmGen(vshlq_s32, vnegq_s32, neon.Int32x4))
+    int64: opTwoGen(shr_neon_i64, neon.Int64x2, shrArmGen(vshlq_s64, vnegq_s64, neon.Int64x2))
+    uint8: opTwoDiffGen(shr_neon_u8, neon.Uint8x16, neon.Int8x16, neon.Uint8x16, shrArmGen(vshlq_u8, vnegq_s8, neon.Uint8x16))
+    uint16: opTwoDiffGen(shr_neon_u16, neon.Uint16x8, neon.Int16x8, neon.Uint16x8, shrArmGen(vshlq_u16, vnegq_s16, neon.Uint16x8))
+    uint32: opTwoDiffGen(shr_neon_u32, neon.Uint32x4, neon.Int32x4, neon.Uint32x4, shrArmGen(vshlq_u32, vnegq_s32, neon.Uint32x4))
+    uint64: opTwoDiffGen(shr_neon_u64, neon.Uint64x2, neon.Int64x2, neon.Uint64x2, shrArmGen(vshlq_u64, vnegq_s64, neon.Uint64x2))
+  `min`:
+    float32: vminq_f32
+    float64: vminq_f64
+    int8: vminq_s8
+    int16: vminq_s16
+    int32: vminq_s32
+    int64: none
+    uint8: vminq_u8
+    uint16: vminq_u16
+    uint32: vminq_u32
+    uint64: none
+  `max`:
+    float32: vmaxq_f32
+    float64: vmaxq_f64
+    int8: vmaxq_s8
+    int16: vmaxq_s16
+    int32: vmaxq_s32
+    int64: none
+    uint8: vmaxq_u8
+    uint16: vmaxq_u16
+    uint32: vmaxq_u32
+    uint64: none
 
 simdUnaryInput("neon"):
   `not`:
@@ -5044,13 +5571,24 @@ simdUnaryInput("neon"):
     int16: vabsq_s16
     int32: vabsq_s32
     int64: vabsq_s64
-    uint8: opOneGen(`abs`, neon.Uint8x16, absUintArmGen())
-    uint16: opOneGen(`abs`, neon.Uint16x8, absUintArmGen())
-    uint32: opOneGen(`abs`, neon.Uint32x4, absUintArmGen())
-    uint64: opOneGen(`abs`, neon.Uint64x2, absUintArmGen())
+    uint8: opOneGen(abs_neon_u8, neon.Uint8x16, absUintArmGen())
+    uint16: opOneGen(abs_neon_u16, neon.Uint16x8, absUintArmGen())
+    uint32: opOneGen(abs_neon_u32, neon.Uint32x4, absUintArmGen())
+    uint64: opOneGen(abs_neon_u64, neon.Uint64x2, absUintArmGen())
+  `sqrt`:
+    float32: vsqrtq_f32
+    float64: vsqrtq_f64
+    int8: none
+    int16: none
+    int32: none
+    int64: none
+    uint8: none
+    uint16: none
+    uint32: none
+    uint64: none
 
 simdMaskInput("neon"):
- `==`:
+  `==`:
     float32: vceq_f32
     float64: vceq_f64
     int8: vceq_s8
@@ -5062,16 +5600,16 @@ simdMaskInput("neon"):
     uint32: vceq_u32
     uint64: vceq_u64
   `!=`:
-    float32: opTwoGen(`!=`, neon.Float32x4, cmpneqNeonGen(vceq_f32, vmvn_f32, neon.Float32x4))
-    float64: opTwoGen(`!=`, neon.Float64x2, cmpneqNeonGen(vceq_f64, vmvn_f64, neon.Float64x2))
-    int8: opTwoGen(`!=`, neon.Int8x16, cmpneqNeonGen(vceq_s8, vmvn_s8, neon.Int8x16))
-    int16: opTwoGen(`!=`, neon.Int16x8, cmpneqNeonGen(vceq_s16, vmvn_s16, neon.Int16x8))
-    int32: opTwoGen(`!=`, neon.Int32x4, cmpneqNeonGen(vceq_s32, vmvn_s32, neon.Int32x4))
-    int64: opTwoGen(`!=`, neon.Int64x2, cmpneqNeonGen(vceq_s64, vmvn_s64, neon.Int64x2))
-    uint8: opTwoGen(`!=`, neon.Uint8x16, cmpneqNeonGen(vceq_u8, vmvn_u8, neon.Uint8x16))
-    uint16: opTwoGen(`!=`, neon.Uint16x8, cmpneqNeonGen(vceq_u16, vmvn_u16, neon.Uint16x8))
-    uint32: opTwoGen(`!=`, neon.Uint32x4, cmpneqNeonGen(vceq_u32, vmvn_u32, neon.Uint32x4))
-    uint64: opTwoGen(`!=`, neon.Uint64x2, cmpneqNeonGen(vceq_u64, vmvn_u64, neon.Uint64x2))
+    float32: opTwoGen(cmpneq_neon_f32, neon.Float32x4, cmpneqNeonGen(vceq_f32, vmvn_f32, neon.Float32x4))
+    float64: opTwoGen(cmpneq_neon_f64, neon.Float64x2, cmpneqNeonGen(vceq_f64, vmvn_f64, neon.Float64x2))
+    int8: opTwoGen(cmpneq_neon_i8, neon.Int8x16, cmpneqNeonGen(vceq_s8, vmvn_s8, neon.Int8x16))
+    int16: opTwoGen(cmpneq_neon_i16, neon.Int16x8, cmpneqNeonGen(vceq_s16, vmvn_s16, neon.Int16x8))
+    int32: opTwoGen(cmpneq_neon_i32, neon.Int32x4, cmpneqNeonGen(vceq_s32, vmvn_s32, neon.Int32x4))
+    int64: opTwoGen(cmpneq_neon_i64, neon.Int64x2, cmpneqNeonGen(vceq_s64, vmvn_s64, neon.Int64x2))
+    uint8: opTwoGen(cmpneq_neon_u8, neon.Uint8x16, cmpneqNeonGen(vceq_u8, vmvn_u8, neon.Uint8x16))
+    uint16: opTwoGen(cmpneq_neon_u16, neon.Uint16x8, cmpneqNeonGen(vceq_u16, vmvn_u16, neon.Uint16x8))
+    uint32: opTwoGen(cmpneq_neon_u32, neon.Uint32x4, cmpneqNeonGen(vceq_u32, vmvn_u32, neon.Uint32x4))
+    uint64: opTwoGen(cmpneq_neon_u64, neon.Uint64x2, cmpneqNeonGen(vceq_u64, vmvn_u64, neon.Uint64x2))
   `<`:
     float32: vclt_f32
     float64: vclt_f64
@@ -5217,16 +5755,16 @@ simdInput("lsx"):
     uint32: lsx_vxor_v
     uint64: lsx_vxor_v
   `nand`:
-    float32: opTwoGen(`nand`, lsx.M128, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    float64: opTwoGen(`nand`, lsx.M128d, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    int8: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    int16: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    int32: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    int64: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    uint8: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    uint16: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    uint32: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
-    uint64: opTwoGen(`nand`, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    float32: opTwoGen(nand_lsx_f32, lsx.M128, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    float64: opTwoGen(nand_lsx_f64, lsx.M128d, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    int8: opTwoGen(nand_lsx_i8, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    int16: opTwoGen(nand_lsx_i16, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    int32: opTwoGen(nand_lsx_i32, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    int64: opTwoGen(nand_lsx_i64, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    uint8: opTwoGen(nand_lsx_u8, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    uint16: opTwoGen(nand_lsx_u16, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    uint32: opTwoGen(nand_lsx_u32, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
+    uint64: opTwoGen(nand_lsx_u64, lsx.M128i, nandLAGen(lsx_vand_v, lsx_vnor_v, lsx.M128i))
   `nor`:
     float32: typeGen(nor_lsx_f32, lsx_vnor_v, lsx.M128, lsx.M128i)
     float64: typeGen(nor_lsx_f64, lsx_vnor_v, lsx.M128d, lsx.M128i)
@@ -5239,16 +5777,16 @@ simdInput("lsx"):
     uint32: lsx_vnor_v
     uint64: lsx_vnor_v
   `nxor`:
-    float32: opTwoGen(`nxor`, lsx.M128, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128))
-    float64: opTwoGen(`nxor`, lsx.M128d, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128d))
-    int8: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    int16: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    int32: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    int64: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    uint8: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    uint16: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    uint32: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
-    uint64: opTwoGen(`nxor`, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    float32: opTwoGen(nxor_lsx_f32, lsx.M128, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128))
+    float64: opTwoGen(nxor_lsx_f64, lsx.M128d, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128d))
+    int8: opTwoGen(nxor_lsx_i8, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    int16: opTwoGen(nxor_lsx_i16, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    int32: opTwoGen(nxor_lsx_i32, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    int64: opTwoGen(nxor_lsx_i64, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    uint8: opTwoGen(nxor_lsx_u8, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    uint16: opTwoGen(nxor_lsx_u16, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    uint32: opTwoGen(nxor_lsx_u32, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
+    uint64: opTwoGen(nxor_lsx_u64, lsx.M128i, nxorLAGen(lsx_vxor_v, lsx_vnor_v, lsx.M128i, lsx.M128i))
   `andnot`:
     float32: typeGen(andnot_lsx_f32, lsx_vandn_v, lsx.M128, lsx.M128i)
     float64: typeGen(andnot_lsx_f64, lsx_vandn_v, lsx.M128d, lsx.M128i)
@@ -5272,8 +5810,8 @@ simdInput("lsx"):
     uint32: lsx_vorn_v
     uint64: lsx_vorn_v
   `shl`:
-    float32: typeGen(`shl_lsx_f32`, lsx_vsll_w, lsx.M128, lsx.M128i)
-    float64: typeGen(`shl_lsx_f64`, lsx_vsll_d, lsx.M128d, lsx.M128i)
+    float32: typeGen(shl_lsx_f32, lsx_vsll_w, lsx.M128, lsx.M128i)
+    float64: typeGen(shl_lsx_f64, lsx_vsll_d, lsx.M128d, lsx.M128i)
     int8: lsx_vsll_b
     int16: lsx_vsll_h
     int32: lsx_vsll_w
@@ -5283,8 +5821,8 @@ simdInput("lsx"):
     uint32: lsx_vsll_w
     uint64: lsx_vsll_d
   `shr`:
-    float32: typeGen(`shr_lsx_f32`, lsx_vsrl_w, lsx.M128, lsx.M128i)
-    float64: typeGen(`shr_lsx_f64`, lsx_vsrl_d, lsx.M128d, lsx.M128i)
+    float32: typeGen(shr_lsx_f32, lsx_vsrl_w, lsx.M128, lsx.M128i)
+    float64: typeGen(shr_lsx_f64, lsx_vsrl_d, lsx.M128d, lsx.M128i)
     int8: lsx_vsra_b
     int16: lsx_vsra_h
     int32: lsx_vsra_w
@@ -5293,19 +5831,41 @@ simdInput("lsx"):
     uint16: lsx_vsrl_h
     uint32: lsx_vsrl_w
     uint64: lsx_vsrl_d
+  `min`:
+    float32: lsx_vfmin_s
+    float64: lsx_vfmin_d
+    int8: lsx_vmin_b
+    int16: lsx_vmin_h
+    int32: lsx_vmin_w
+    int64: lsx_vmin_d
+    uint8: lsx_vmin_bu
+    uint16: lsx_vmin_hu
+    uint32: lsx_vmin_wu
+    uint64: lsx_vmin_du
+  `max`:
+    float32: lsx_vfmax_s
+    float64: lsx_vfmax_d
+    int8: lsx_vmax_b
+    int16: lsx_vmax_h
+    int32: lsx_vmax_w
+    int64: lsx_vmax_d
+    uint8: lsx_vmax_bu
+    uint16: lsx_vmax_hu
+    uint32: lsx_vmax_wu
+    uint64: lsx_vmax_du
 
 simdUnaryInput("lsx"):
   `not`:
-    float32: opOneGen(`not`, lsx.M128, notLAGen(lsx_vnor_v, lsx.M128i))
-    float64: opOneGen(`not`, lsx.M128d, notLAGen(lsx_vnor_v, lsx.M128i))
-    int8: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    int16: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    int32: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    int64: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    uint8: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    uint16: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    uint32: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
-    uint64: opOneGen(`not`, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    float32: opOneGen(not_lsx_f32, lsx.M128, notLAGen(lsx_vnor_v, lsx.M128i))
+    float64: opOneGen(not_lsx_f64, lsx.M128d, notLAGen(lsx_vnor_v, lsx.M128i))
+    int8: opOneGen(not_lsx_i8, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    int16: opOneGen(not_lsx_i16, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    int32: opOneGen(not_lsx_i32, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    int64: opOneGen(not_lsx_i64, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    uint8: opOneGen(not_lsx_u8, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    uint16: opOneGen(not_lsx_u16, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    uint32: opOneGen(not_lsx_u32, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
+    uint64: opOneGen(not_lsx_u64, lsx.M128i, notLAGen(lsx_vnor_v, lsx.M128i))
   `abs`:
     float32: lsx_vfabs_s
     float64: lsx_vfabs_d
@@ -5313,10 +5873,21 @@ simdUnaryInput("lsx"):
     int16: lsx_vabs_h
     int32: lsx_vabs_w
     int64: lsx_vabs_d
-    uint8: opOneGen(`abs`, lsx.M128i, absUintLAGen())
-    uint16: opOneGen(`abs`, lsx.M128i, absUintLAGen())
-    uint32: opOneGen(`abs`, lsx.M128i, absUintLAGen())
-    uint64: opOneGen(`abs`, lsx.M128i, absUintLAGen())
+    uint8: opOneGen(abs_lsx_u8, lsx.M128i, absUintLAGen())
+    uint16: opOneGen(abs_lsx_u16, lsx.M128i, absUintLAGen())
+    uint32: opOneGen(abs_lsx_u32, lsx.M128i, absUintLAGen())
+    uint64: opOneGen(abs_lsx_u64, lsx.M128i, absUintLAGen())
+  `sqrt`:
+    float32: lsx_vfsqrt_s
+    float64: lsx_vfsqrt_d
+    int8: none
+    int16: none
+    int32: none
+    int64: none
+    uint8: none
+    uint16: none
+    uint32: none
+    uint64: none
 
 simdMaskInput("lsx"):
   `==`:
@@ -5333,14 +5904,14 @@ simdMaskInput("lsx"):
   `!=`:
     float32: lsx_vfcmp_cne_s
     float64: lsx_vfcmp_cne_d
-    int8: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_b, lsx_vnor_v, lsx.M128i))
-    int16: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_h, lsx_vnor_v, lsx.M128i))
-    int32: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_w, lsx_vnor_v, lsx.M128i))
-    int64: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_d, lsx_vnor_v, lsx.M128i))
-    uint8: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_b, lsx_vnor_v, lsx.M128i))
-    uint16: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_h, lsx_vnor_v, lsx.M128i))
-    uint32: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_w, lsx_vnor_v, lsx.M128i))
-    uint64: opTwoGen(`!=`, lsx.M128i, cmpneqIntLAGen(lsx_vseq_d, lsx_vnor_v, lsx.M128i))
+    int8: opTwoGen(cmpneq_lsx_i8, lsx.M128i, cmpneqIntLAGen(lsx_vseq_b, lsx_vnor_v, lsx.M128i))
+    int16: opTwoGen(cmpneq_lsx_i16, lsx.M128i, cmpneqIntLAGen(lsx_vseq_h, lsx_vnor_v, lsx.M128i))
+    int32: opTwoGen(cmpneq_lsx_i32, lsx.M128i, cmpneqIntLAGen(lsx_vseq_w, lsx_vnor_v, lsx.M128i))
+    int64: opTwoGen(cmpneq_lsx_i64, lsx.M128i, cmpneqIntLAGen(lsx_vseq_d, lsx_vnor_v, lsx.M128i))
+    uint8: opTwoGen(cmpneq_lsx_u8, lsx.M128i, cmpneqIntLAGen(lsx_vseq_b, lsx_vnor_v, lsx.M128i))
+    uint16: opTwoGen(cmpneq_lsx_u16, lsx.M128i, cmpneqIntLAGen(lsx_vseq_h, lsx_vnor_v, lsx.M128i))
+    uint32: opTwoGen(cmpneq_lsx_u32, lsx.M128i, cmpneqIntLAGen(lsx_vseq_w, lsx_vnor_v, lsx.M128i))
+    uint64: opTwoGen(cmpneq_lsx_u64, lsx.M128i, cmpneqIntLAGen(lsx_vseq_d, lsx_vnor_v, lsx.M128i))
   `<`:
     float32: lsx_vfcmp_clt_s
     float64: lsx_vfcmp_clt_d
@@ -5353,8 +5924,8 @@ simdMaskInput("lsx"):
     uint32: lsx_vsltu_w
     uint64: lsx_vsltu_d
   `>`:
-    float32: opTwoGen(`>`, lsx.M128i, cmpgtFloatLAGen(lsx_vfcmp_clt_s, lsx.M128))
-    float64: opTwoGen(`>`, lsx.M128i, cmpgtFloatLAGen(lsx_vfcmp_clt_d, lsx.M128d))
+    float32: opTwoGen(cmpgt_lsx_f32, lsx.M128, cmpgtFloatLAGen(lsx_vfcmp_clt_s, lsx.M128))
+    float64: opTwoGen(cmpgt_lsx_f64, lsx.M128d, cmpgtFloatLAGen(lsx_vfcmp_clt_d, lsx.M128d))
     int8: lsx_vsgt_b
     int16: lsx_vsgt_h
     int32: lsx_vsgt_w
@@ -5364,8 +5935,8 @@ simdMaskInput("lsx"):
     uint32: lsx_vsgtu_w
     uint64: lsx_vsgtu_d
   `>=`:
-    float32: opTwoGen(`>=`, lsx.M128i, cmpgeFloatLAGen(lsx_vfcmp_cle_s, lsx.M128))
-    float64: opTwoGen(`>=`, lsx.M128i, cmpgeFloatLAGen(lsx_vfcmp_cle_d, lsx.M128d))
+    float32: opTwoGen(cmpge_lsx_f32, lsx.M128, cmpgeFloatLAGen(lsx_vfcmp_cle_s, lsx.M128))
+    float64: opTwoGen(cmpge_lsx_f64, lsx.M128d, cmpgeFloatLAGen(lsx_vfcmp_cle_d, lsx.M128d))
     int8: lsx_vsge_b
     int16: lsx_vsge_h
     int32: lsx_vsge_w
@@ -5407,9 +5978,9 @@ simdInput("lasx"):
     int32: lasx_xvsub_w
     int64: lasx_xvsub_d
     uint8: lasx_xvsub_b
-    int16: lasx_xvsub_h
-    int32: lasx_xvsub_w
-    int64: lasx_xvsub_d
+    uint16: lasx_xvsub_h
+    uint32: lasx_xvsub_w
+    uint64: lasx_xvsub_d
   `*`:
     float32: lasx_xvfmul_s
     float64: lasx_xvfmul_d
@@ -5455,19 +6026,19 @@ simdInput("lasx"):
     uint32: lasx_xvxor_v
     uint64: lasx_xvxor_v
   `nand`:
-    float32: opTwoGen(`nand`, lasx.M256, nandLAGen(lasx_xvand_v, lasx_vnor_v, lasx.M256i))
-    float64: opTwoGen(`nand`, lasx.M256d, nandLAGen(lasx_xvand_v, lasx_vnor_v, lasx.M256i))
-    int8: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    int16: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    int32: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    int64: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    uint8: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    uint16: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    uint32: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
-    uint64: opTwoGen(`nand`, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    float32: opTwoGen(nand_lasx_f32, lasx.M256, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    float64: opTwoGen(nand_lasx_f64, lasx.M256d, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    int8: opTwoGen(nand_lasx_i8, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    int16: opTwoGen(nand_lasx_i16, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    int32: opTwoGen(nand_lasx_i32, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    int64: opTwoGen(nand_lasx_i64, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    uint8: opTwoGen(nand_lasx_u8, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    uint16: opTwoGen(nand_lasx_u16, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    uint32: opTwoGen(nand_lasx_u32, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
+    uint64: opTwoGen(nand_lasx_u64, lasx.M256i, nandLAGen(lasx_xvand_v, lasx_xvnor_v, lasx.M256i))
   `nor`:
-    float32: typeGen(nor_lasx_f32, lasx_xvnor_v, lsx.M256, lsx.M256i)
-    float64: typeGen(nor_lasx_f64, lasx_xvnor_v, lsx.M256d, lsx.M256i)
+    float32: typeGen(nor_lasx_f32, lasx_xvnor_v, lasx.M256, lasx.M256i)
+    float64: typeGen(nor_lasx_f64, lasx_xvnor_v, lasx.M256d, lasx.M256i)
     int8: lasx_xvnor_v
     int16: lasx_xvnor_v
     int32: lasx_xvnor_v
@@ -5477,16 +6048,16 @@ simdInput("lasx"):
     uint32: lasx_xvnor_v
     uint64: lasx_xvnor_v
   `nxor`:
-    float32: opTwoGen(`nxor`, lasx.M256, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256))
-    float64: opTwoGen(`nxor`, lasx.M256d, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256d))
-    int8: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    int16: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    int32: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    int64: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    uint8: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    uint16: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    uint32: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
-    uint64: opTwoGen(`nxor`, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    float32: opTwoGen(nxor_lasx_f32, lasx.M256, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256))
+    float64: opTwoGen(nxor_lasx_f64, lasx.M256d, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256d))
+    int8: opTwoGen(nxor_lasx_i8, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    int16: opTwoGen(nxor_lasx_i16, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    int32: opTwoGen(nxor_lasx_i32, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    int64: opTwoGen(nxor_lasx_i64, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    uint8: opTwoGen(nxor_lasx_u8, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    uint16: opTwoGen(nxor_lasx_u16, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    uint32: opTwoGen(nxor_lasx_u32, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
+    uint64: opTwoGen(nxor_lasx_u64, lasx.M256i, nxorLAGen(lasx_xvxor_v, lasx_xvnor_v, lasx.M256i, lasx.M256i))
   `andnot`:
     float32: typeGen(andnot_lasx_f32, lasx_xvandn_v, lasx.M256, lasx.M256i)
     float64: typeGen(andnot_lasx_f64, lasx_xvandn_v, lasx.M256d, lasx.M256i)
@@ -5510,8 +6081,8 @@ simdInput("lasx"):
     uint32: lasx_xvorn_v
     uint64: lasx_xvorn_v
   `shl`:
-    float32: typeGen(`shl_lasx_f32`, lasx_xsll_w, lasx.M256, lasx.M256i)
-    float64: typeGen(`shl_lasx_f64`, lasx_xsll_d, lasx.M256d, lasx.M256i)
+    float32: typeGen(shl_lasx_f32, lasx_xsll_w, lasx.M256, lasx.M256i)
+    float64: typeGen(shl_lasx_f64, lasx_xsll_d, lasx.M256d, lasx.M256i)
     int8: lasx_xsll_b
     int16: lasx_xsll_h
     int32: lasx_xsll_w
@@ -5521,8 +6092,8 @@ simdInput("lasx"):
     uint32: lasx_xsll_w
     uint64: lasx_xsll_d
   `shr`:
-    float32: typeGen(`shr_lasx_f32`, lasx_xsrl_w, lasx.M256, lasx.M256i)
-    float64: typeGen(`shr_lasx_f64`, lasx_xsrl_d, lasx.M256d, lasx.M256i)
+    float32: typeGen(shr_lasx_f32, lasx_xsrl_w, lasx.M256, lasx.M256i)
+    float64: typeGen(shr_lasx_f64, lasx_xsrl_d, lasx.M256d, lasx.M256i)
     int8: lasx_xsra_b
     int16: lasx_xsra_h
     int32: lasx_xsra_w
@@ -5531,19 +6102,41 @@ simdInput("lasx"):
     uint16: lasx_xsrl_h
     uint32: lasx_xsrl_w
     uint64: lasx_xsrl_d
+  `min`:
+    float32: lasx_xvfmin_s
+    float64: lasx_xvfmin_d
+    int8: lasx_xvmin_b
+    int16: lasx_xvmin_h
+    int32: lasx_xvmin_w
+    int64: lasx_xvmin_d
+    uint8: lasx_xvmin_bu
+    uint16: lasx_xvmin_hu
+    uint32: lasx_xvmin_wu
+    uint64: lasx_xvmin_du
+  `max`:
+    float32: lasx_xvfmax_s
+    float64: lasx_xvfmax_d
+    int8: lasx_xvmax_b
+    int16: lasx_xvmax_h
+    int32: lasx_xvmax_w
+    int64: lasx_xvmax_d
+    uint8: lasx_xvmax_bu
+    uint16: lasx_xvmax_hu
+    uint32: lasx_xvmax_wu
+    uint64: lasx_xvmax_du
 
 simdUnaryInput("lasx"):
   `not`:
-    float32: opOneGen(`not`, lasx.M256, notLAGen(lasx_xvnor_v, lsx.M256i))
-    float64: opOneGen(`not`, lasx.M256d, notLAGen(lasx_xvnor_v, lsx.M256i))
-    int8: opOneGen(`not, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    int16: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    int32: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    int64: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    uint8: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    uint16: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    uint32: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
-    uint64: opOneGen(`not`, lasx.M256i, notLAGen(lasx_xvnor_v, lsx.M256i))
+    float32: opOneGen(not_lasx_f32, lasx.M256, notLAGen(lasx_xvnor_v, lasx.M256i))
+    float64: opOneGen(not_lasx_f64, lasx.M256d, notLAGen(lasx_xvnor_v, lasx.M256i))
+    int8: opOneGen(not_lasx_i8, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    int16: opOneGen(not_lasx_i16, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    int32: opOneGen(not_lasx_i32, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    int64: opOneGen(not_lasx_i64, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    uint8: opOneGen(not_lasx_u8, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    uint16: opOneGen(not_lasx_u16, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    uint32: opOneGen(not_lasx_u32, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
+    uint64: opOneGen(not_lasx_u64, lasx.M256i, notLAGen(lasx_xvnor_v, lasx.M256i))
   `abs`:
     float32: lasx_xvfabs_s
     float64: lasx_xvfabs_d
@@ -5551,10 +6144,21 @@ simdUnaryInput("lasx"):
     int16: lasx_xvabs_h
     int32: lasx_xvabs_w
     int64: lasx_xvabs_d
-    uint8: opOneGen(`abs`, lasx.M256i, absUintLAGen())
-    uint16: opOneGen(`abs`, lasx.M256i, absUintLAGen())
-    uint32: opOneGen(`abs`, lasx.M256i, absUintLAGen())
-    uint64: opOneGen(`abs`, lasx.M256i, absUintLAGen())
+    uint8: opOneGen(abs_lasx_u8, lasx.M256i, absUintLAGen())
+    uint16: opOneGen(abs_lasx_u16, lasx.M256i, absUintLAGen())
+    uint32: opOneGen(abs_lasx_u32, lasx.M256i, absUintLAGen())
+    uint64: opOneGen(abs_lasx_u64, lasx.M256i, absUintLAGen())
+  `sqrt`:
+    float32: lasx_xvfsqrt_s
+    float64: lasx_xvfsqrt_d
+    int8: error
+    int16: error
+    int32: error
+    int64: error
+    uint8: error
+    uint16: none
+    uint32: none
+    uint64: none
 
 simdMaskInput("lasx"):
   `==`:
@@ -5571,14 +6175,14 @@ simdMaskInput("lasx"):
   `!=`:
     float32: lasx_xvfcmp_cne_s
     float64: lasx_xvfcmp_cne_d
-    int8: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_b, lasx_xvnor_v, lasx.M256i))
-    int16: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_h, lasx_xvnor_v, lasx.M256i))
-    int32: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_w, lasx_xvnor_v, lasx.M256i))
-    int64: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_d, lasx_xvnor_v, lasx.M256i))
-    uint8: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_b, lasx_xvnor_v, lasx.M256i))
-    uint16: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_h, lasx_xvnor_v, lasx.M256i))
-    uint32: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_w, lasx_xvnor_v, lasx.M256i))
-    uint64: opTwoGen(`!=`, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_d, lasx_xvnor_v, lasx.M256i))
+    int8: opTwoGen(cmpneq_lasx_i8, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_b, lasx_xvnor_v, lasx.M256i))
+    int16: opTwoGen(cmpneq_lasx_i16, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_h, lasx_xvnor_v, lasx.M256i))
+    int32: opTwoGen(cmpneq_lasx_i32, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_w, lasx_xvnor_v, lasx.M256i))
+    int64: opTwoGen(cmpneq_lasx_i64, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_d, lasx_xvnor_v, lasx.M256i))
+    uint8: opTwoGen(cmpneq_lasx_u8, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_b, lasx_xvnor_v, lasx.M256i))
+    uint16: opTwoGen(cmpneq_lasx_u16, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_h, lasx_xvnor_v, lasx.M256i))
+    uint32: opTwoGen(cmpneq_lasx_u32, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_w, lasx_xvnor_v, lasx.M256i))
+    uint64: opTwoGen(cmpneq_lasx_u64, lasx.M256i, cmpneqIntLAGen(lasx_xvseq_d, lasx_xvnor_v, lasx.M256i))
   `<`:
     float32: lasx_xvfcmp_clt_s
     float64: lasx_xvfcmp_clt_d
@@ -5591,8 +6195,8 @@ simdMaskInput("lasx"):
     uint32: lasx_xvsltu_w
     uint64: lasx_xvsltu_d
   `>`:
-    float32: opTwoGen(`>`, lasx.M256i, cmpgtFloatLAGen(lasx_xvfcmp_clt_s, lasx.M256))
-    float64: opTwoGen(`>`, lasx.M256i, cmpgtFloatLAGen(lasx_xvfcmp_clt_d, lasx.M256d))
+    float32: opTwoGen(cmpgt_lasx_f32, lasx.M256, cmpgtFloatLAGen(lasx_xvfcmp_clt_s, lasx.M256))
+    float64: opTwoGen(cmpgt_lasx_f64, lasx.M256d, cmpgtFloatLAGen(lasx_xvfcmp_clt_d, lasx.M256d))
     int8: lasx_xvsgt_b
     int16: lasx_xvsgt_h
     int32: lasx_xvsgt_w
@@ -5602,8 +6206,8 @@ simdMaskInput("lasx"):
     uint32: lasx_xvsgtu_w
     uint64: lasx_xvsgtu_d
   `>=`:
-    float32: opTwoGen(`>=`, lasx.M256i, cmpgeFloatLAGen(lasx_xvfcmp_cle_s, lasx.M256))
-    float64: opTwoGen(`>=`, lasx.M256i, cmpgeFloatLAGen(lasx_xvfcmp_cle_d, lasx.M256d))
+    float32: opTwoGen(cmpge_lasx_f32, lasx.M256, cmpgeFloatLAGen(lasx_xvfcmp_cle_s, lasx.M256))
+    float64: opTwoGen(cmpge_lasx_f64, lasx.M256d, cmpgeFloatLAGen(lasx_xvfcmp_cle_d, lasx.M256d))
     int8: lasx_xvsge_b
     int16: lasx_xvsge_h
     int32: lasx_xvsge_w

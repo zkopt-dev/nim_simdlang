@@ -49,23 +49,23 @@ func mm256_avx512_cvtepi16_epi32*(x: M128i): M256i {.importc: "_mm256_avx512_cvt
 # lane unit : float32[8] + float32[8] -> bf16[16] / total : 256-bit
 func mm256_cvtne2ps_pbh*(a: M256, b: M256): M256bh {.importc: "_mm256_cvtne2ps_pbh".}
 
-# operating : conditionally convert 두 256-bit FP32 vectors to BF16 using a mask (merge with a)
+# operating : conditionally convert  256-bit FP32 vectors to BF16 using a mask (merge with a)
 # lane unit : float32 + float32 -> bf16 (masked) / total : 256-bit
 func mm256_mask_cvtne2ps_pbh*(a: M256bh, b: MMask16, c: M256, d: M256): M256bh {.importc: "_mm256_mask_cvtne2ps_pbh".}
 
-# operating : conditionally convert 두 256-bit FP32 vectors to BF16 using a mask (zero-initialized)
+# operating : conditionally convert  256-bit FP32 vectors to BF16 using a mask (zero-initialized)
 # lane unit : float32 + float32 -> bf16 (maskz) / total : 256-bit
 func mm256_maskz_cvtne2ps_pbh*(a: MMask16, b: M256, c: M256): M256bh {.importc: "_mm256_maskz_cvtne2ps_pbh".}
 
-# operating : convert 두 128-bit FP32 vectors (a, b) into one 128-bit BF16 vector using nearest-even rounding
+# operating : convert  128-bit FP32 vectors (a, b) into one 128-bit BF16 vector using nearest-even rounding
 # lane unit : float32[4] + float32[4] -> bf16[8] / total : 128-bit
 func mm_cvtne2ps_pbh*(a: M128, b: M128): M128bh {.importc: "_mm_cvtne2ps_pbh".}
 
-# operating : conditionally convert 두 128-bit FP32 vectors to BF16 using a mask (merge with a)
+# operating : conditionally convert  128-bit FP32 vectors to BF16 using a mask (merge with a)
 # lane unit : float32 + float32 -> bf16 (masked) / total : 128-bit
 func mm_mask_cvtne2ps_pbh*(a: M128bh, b: MMask8, c: M128, d: M128): M128bh {.importc: "_mm_mask_cvtne2ps_pbh".}
 
-# operating : conditionally convert 두 128-bit FP32 vectors to BF16 using a mask (zero-initialized)
+# operating : conditionally convert  128-bit FP32 vectors to BF16 using a mask (zero-initialized)
 # lane unit : float32 + float32 -> bf16 (maskz) / total : 128-bit
 func mm_maskz_cvtne2ps_pbh*(a: MMask8, b: M128, c: M128): M128bh {.importc: "_mm_maskz_cvtne2ps_pbh".}
 

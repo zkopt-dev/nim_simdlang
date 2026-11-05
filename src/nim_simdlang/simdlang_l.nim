@@ -9006,7 +9006,7 @@ func ornot_i64v128_sse(a, b: i64v128): i64v128 =
 let x86_ornot_i64v128: proc(a, b: i64v128): i64v128 = if sseExists(): ornot_i64v128_sse else: ornot_i64v128_fallback
 
 func ornot_i64v128_neon(a, b: i64v128): i64v128 =
-  # NEON 64비트 정수 ORN 지원을 위해 데이터 레이어를 깨뜨리지 않고 u64 연산 명세 매핑
+  # NEON 64  ORN       u64   
   return cast[i64v128](vornq_u64(cast[neon.Uint64x2](a), cast[neon.Uint64x2](b)))
 
 let arm_ornot_i64v128: proc(a, b: i64v128): i64v128 = if neonExists(): ornot_i64v128_neon else: ornot_i64v128_fallback
@@ -12729,7 +12729,7 @@ func ncq_i8r128_neon(a, b: i8r128): u8r128 =
 let arm_ncq_i8r128: proc(a, b: i8r128): u8r128 = if neonExists(): ncq_i8r128_neon else: ncq_i8r128_fallback
 
 func ncq_i8r128_lsx(a, b: i8r128): u8r128 =
-  # LSX 정수형은 직접적인 != 가 없으므로 seq 후 vnor로 반전시킵니다.
+  # LSX   !=   seq  vnor .
   let eq = lsx_vseq_b(cast[lsx.M128i](a), cast[lsx.M128i](b))
   return cast[u8r128](lsx_vnor_v(eq, eq))
 
@@ -13431,7 +13431,7 @@ func ncl_i8r128_fallback(a, b: i8r128): u8r128 =
   return output
 
 func ncl_i8r128_sse(a, b: i8r128): u8r128 =
-  # SSE는 cmplt가 없으므로 피연산자 순서를 바꾼 cmpgt(b, a)로 구현합니다.
+  # SSE cmplt     cmpgt(b, a) .
   return cast[u8r128](mm_cmpgt_epi8(cast[sse2.M128i](b), cast[sse2.M128i](a)))
 
 let x86_ncl_i8r128: proc(a, b: i8r128): u8r128 = if sseExists(): ncl_i8r128_sse else: ncl_i8r128_fallback
@@ -13531,7 +13531,7 @@ func ncl_i64r128_fallback(a, b: i64r128): u64r128 =
   return output
 
 func ncl_i64r128_sse(a, b: i64r128): u64r128 =
-  # SSE4.2 이상 혹은 SSE2 에뮬레이션 환경에 맞춰 고정적 매핑인 cmpgt_epi64(b, a)를 수행합니다.
+  # SSE4.2   SSE2      cmpgt_epi64(b, a) .
   return cast[u64r128](mm_cmpgt_epi64(cast[sse2.M128i](b), cast[sse2.M128i](a)))
 
 let x86_ncl_i64r128: proc(a, b: i64r128): u64r128 = if sseExists(): ncl_i64r128_sse else: ncl_i64r128_fallback
@@ -13565,7 +13565,7 @@ func ncl_u8r128_fallback(a, b: u8r128): u8r128 =
   return output
 
 func ncl_u8r128_sse(a, b: u8r128): u8r128 =
-  # SSE2에는 부호 없는 정수형 비교가 없으므로 최상위 비트(0x80)를 반전시켜 부호 있는 정수로 취급한 후 비교합니다.
+  # SSE2       (0x80)       .
   let offset = mm_set1_epi8(cast[int8](0x80'u8))
   let va = mm_xor_si128(cast[sse2.M128i](a), offset)
   let vb = mm_xor_si128(cast[sse2.M128i](b), offset)
@@ -14805,7 +14805,7 @@ func ncle_i8r128_fallback(a, b: i8r128): u8r128 =
   return output
 
 func ncle_i8r128_sse(a, b: i8r128): u8r128 =
-  # NOT (A > B) 관계 이용
+  # NOT (A > B)  
   let gt = mm_cmpgt_epi8(cast[sse2.M128i](a), cast[sse2.M128i](b))
   let all_ones = mm_set1_epi8(cast[int8](0xFF'u8))
   return cast[u8r128](mm_andnot_si128(gt, all_ones))
@@ -14912,7 +14912,7 @@ func ncle_i64r128_fallback(a, b: i64r128): u64r128 =
 
 func ncle_i64r128_sse(a, b: i64r128): u64r128 =
   let gt = mm_cmpgt_epi64(cast[sse2.M128i](a), cast[sse2.M128i](b))
-  let all_ones = mm_set1_epi32(cast[int32](0xFFFFFFFF'u32)) # epi64 NOT용 마스크
+  let all_ones = mm_set1_epi32(cast[int32](0xFFFFFFFF'u32)) # epi64 NOT 
   return cast[u64r128](mm_andnot_si128(gt, all_ones))
 
 let x86_ncle_i64r128: proc(a, b: i64r128): u64r128 = if sseExists(): ncle_i64r128_sse else: ncle_i64r128_fallback
@@ -15524,7 +15524,7 @@ func ncge_i8v128_fallback(a, b: i8v128): u8v128 =
   return output
 
 func ncge_i8v128_sse(a, b: i8v128): u8v128 =
-  # NOT (B > A) 관계 이용
+  # NOT (B > A)  
   let gt = mm_cmpgt_epi8(cast[sse2.M128i](b), cast[sse2.M128i](a))
   let all_ones = mm_set1_epi8(cast[int8](0xFF'u8))
   return cast[u8v128](mm_andnot_si128(gt, all_ones))
